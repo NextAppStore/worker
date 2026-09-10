@@ -23,11 +23,11 @@ sqlalchemy = "^2.0.23"
 psycopg2-binary = "^2.9.9"
 pydantic = "^2.5.0"
 pydantic-settings = "^2.14.2"
-gitpython = "^3.1.55"
+gitpython = "^3.1.62"
 python-dotenv = "^1.0.0"
 pyyaml = "^6.0.1"
 watchdog = "^4.0"
-cryptography = "^48.0"
+cryptography = "^50.0"
 redis = "^5.0"
 
 [tool.poetry.group.dev.dependencies]
