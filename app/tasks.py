@@ -571,6 +571,35 @@ def _apply_image_name_vars(target: dict[str, Any], plans: list[_ImagePlan], app_
         target[plan.terraform_var_name] = plan.image_name(app_id, image_tag)
 
 
+def _require_ok(
+    result: tuple[bool, str, str],
+    *,
+    op: str,
+    task_logger: Any,
+    error_message: str,
+) -> str:
+    """Return a CLI step's stdout, or log its output and raise.
+
+    The executors log richly, but to a module-level ``StructuredLogger``
+    that has no event emitter and whose buffer nobody drains — so none of
+    it reaches the per-deployment transcript the frontend renders. Every
+    call site therefore re-logged the tool's own output by hand before
+    raising. This is that block, written once.
+
+    Both streams are logged because ``_stream_subprocess`` merges stderr
+    into stdout for streamed commands but returns a real stderr on a
+    timeout or an internal failure.
+    """
+    success, stdout, stderr = result
+    if success:
+        return stdout
+    for stream_name, text in (("stdout", stdout), ("stderr", stderr)):
+        if text:
+            task_logger.command_output(f"{op}_{stream_name}", text, returncode=1)
+    task_logger.error(error_message, category=LogCategory.ERROR)
+    raise Exception(error_message)
+
+
 def _cleanup_task_resources(clouds_config: PerTaskCloudsConfig | None, repo_path: str | None, task_logger: Any) -> None:
     """Best-effort teardown shared by every task's ``finally`` block.
 
@@ -693,13 +722,12 @@ def _build_one_packer_image(
                 )
 
                 phase_tracker.mark(init_phase, f"{log_prefix}Initializing Packer plugins")
-                success, stdout, stderr = packer.init()
-                if not success:
-                    if stdout:
-                        task_logger.command_output("packer_init_stdout", stdout, returncode=1)
-                    if stderr:
-                        task_logger.command_output("packer_init_stderr", stderr, returncode=1)
-                    raise Exception(f"{log_prefix}Packer init failed")
+                _require_ok(
+                    packer.init(),
+                    op="packer_init",
+                    task_logger=task_logger,
+                    error_message=f"{log_prefix}Packer init failed",
+                )
 
                 phase_tracker.mark(validate_phase, f"{log_prefix}Validating Packer template")
                 success, stdout, stderr = packer.validate("template.pkr.hcl", packer_vars)
@@ -930,17 +958,12 @@ def deploy_application(
             )
 
             phase_tracker.mark(PHASE_TERRAFORM_INIT, "Initializing Terraform")
-            success, stdout, stderr = terraform.init()
-            if not success:
-                # Surface the real reason in the per-deployment log; the
-                # module-level logger only writes to worker stdout, which the
-                # frontend never sees.
-                if stdout:
-                    task_logger.command_output("terraform_init_stdout", stdout, returncode=1)
-                if stderr:
-                    task_logger.command_output("terraform_init_stderr", stderr, returncode=1)
-                task_logger.error("Terraform init failed", category=LogCategory.ERROR)
-                raise Exception("Terraform init failed")
+            _require_ok(
+                terraform.init(),
+                op="terraform_init",
+                task_logger=task_logger,
+                error_message="Terraform init failed",
+            )
             task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
 
             # Merge user_vars with teams for Terraform. Nested structures
@@ -976,25 +999,21 @@ def deploy_application(
             )
 
             phase_tracker.mark(PHASE_TERRAFORM_PLAN, "Planning Terraform deployment")
-            success, stdout, stderr = terraform.plan(variables=terraform_vars)
-            if not success:
-                if stdout:
-                    task_logger.command_output("terraform_plan_stdout", stdout, returncode=1)
-                if stderr:
-                    task_logger.command_output("terraform_plan_stderr", stderr, returncode=1)
-                task_logger.error("Terraform plan failed", category=LogCategory.ERROR)
-                raise Exception("Terraform plan failed")
+            _require_ok(
+                terraform.plan(variables=terraform_vars),
+                op="terraform_plan",
+                task_logger=task_logger,
+                error_message="Terraform plan failed",
+            )
             task_logger.success("Terraform plan completed successfully", category=LogCategory.STATUS)
 
             phase_tracker.mark(PHASE_TERRAFORM_APPLY, "Applying configuration (this may take minutes)")
-            success, stdout, stderr = terraform.apply(variables=terraform_vars)
-            if not success:
-                if stdout:
-                    task_logger.command_output("terraform_apply_stdout", stdout, returncode=1)
-                if stderr:
-                    task_logger.command_output("terraform_apply_stderr", stderr, returncode=1)
-                task_logger.error("Terraform apply failed", category=LogCategory.ERROR)
-                raise Exception("Terraform apply failed")
+            _require_ok(
+                terraform.apply(variables=terraform_vars),
+                op="terraform_apply",
+                task_logger=task_logger,
+                error_message="Terraform apply failed",
+            )
             task_logger.success("Terraform resources created", category=LogCategory.STATUS)
 
             # Collect outputs and state
@@ -1240,26 +1259,24 @@ def destroy_deployment(
         )
 
         phase_tracker.mark(PHASE_TERRAFORM_INIT, "Initializing Terraform")
-        success, stdout, stderr = terraform.init()
-        if not success:
-            if stdout:
-                task_logger.command_output("terraform_init_stdout", stdout, returncode=1)
-            if stderr:
-                task_logger.command_output("terraform_init_stderr", stderr, returncode=1)
-            raise Exception("Terraform init failed")
+        _require_ok(
+            terraform.init(),
+            op="terraform_init",
+            task_logger=task_logger,
+            error_message="Terraform init failed",
+        )
         task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
 
         phase_tracker.mark(PHASE_TERRAFORM_DESTROY, "Destroying resources")
         # The stale-data-source retry (-refresh=false when a deleted
         # image/network blocks the refresh) lives in TerraformExecutor.destroy,
         # so every destroy path inherits it — including deploy's cleanup.
-        success, stdout, stderr = terraform.destroy(variables=terraform_vars)
-        if not success:
-            if stdout:
-                task_logger.command_output("terraform_destroy_stdout", stdout, returncode=1)
-            if stderr:
-                task_logger.command_output("terraform_destroy_stderr", stderr, returncode=1)
-            raise Exception("Terraform destroy failed")
+        _require_ok(
+            terraform.destroy(variables=terraform_vars),
+            op="terraform_destroy",
+            task_logger=task_logger,
+            error_message="Terraform destroy failed",
+        )
         task_logger.success("Terraform resources destroyed", category=LogCategory.STATUS)
 
         phase_tracker.mark(PHASE_CLEANUP, "Pulling final state")
@@ -1440,13 +1457,12 @@ def _run_compute_lifecycle(
         )
 
         phase_tracker.mark(PHASE_TERRAFORM_INIT, "Initializing Terraform")
-        success, stdout, stderr = terraform.init()
-        if not success:
-            if stdout:
-                task_logger.command_output("terraform_init_stdout", stdout, returncode=1)
-            if stderr:
-                task_logger.command_output("terraform_init_stderr", stderr, returncode=1)
-            raise Exception("Terraform init failed")
+        _require_ok(
+            terraform.init(),
+            op="terraform_init",
+            task_logger=task_logger,
+            error_message="Terraform init failed",
+        )
         task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
 
         # Pull the canonical state from the pg backend, then walk it
@@ -1925,13 +1941,12 @@ def redeploy_resource(
         )
 
         phase_tracker.mark(PHASE_TERRAFORM_INIT, "Initializing Terraform")
-        success, stdout, stderr = terraform.init()
-        if not success:
-            if stdout:
-                task_logger.command_output("terraform_init_stdout", stdout, returncode=1)
-            if stderr:
-                task_logger.command_output("terraform_init_stderr", stderr, returncode=1)
-            raise Exception("Terraform init failed")
+        _require_ok(
+            terraform.init(),
+            op="terraform_init",
+            task_logger=task_logger,
+            error_message="Terraform init failed",
+        )
         task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
 
         phase_tracker.mark(
@@ -1942,17 +1957,16 @@ def redeploy_resource(
         # destroy+create on it; ``-target`` scopes the apply to that
         # resource (and its dependencies) so the rest of the graph is
         # untouched.
-        success, stdout, stderr = terraform.apply(
-            variables=terraform_vars,
-            targets=[resource_address],
-            replace=[resource_address],
+        _require_ok(
+            terraform.apply(
+                variables=terraform_vars,
+                targets=[resource_address],
+                replace=[resource_address],
+            ),
+            op="terraform_apply",
+            task_logger=task_logger,
+            error_message="Terraform apply (replace) failed",
         )
-        if not success:
-            if stdout:
-                task_logger.command_output("terraform_apply_stdout", stdout, returncode=1)
-            if stderr:
-                task_logger.command_output("terraform_apply_stderr", stderr, returncode=1)
-            raise Exception("Terraform apply (replace) failed")
         task_logger.success(
             f"Resource {resource_address} replaced",
             category=LogCategory.STATUS,

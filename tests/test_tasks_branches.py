@@ -13,6 +13,7 @@ per-test basis so the event bus is silenced.
 
 import json
 import os
+from unittest import mock
 
 import pytest
 
@@ -26,6 +27,7 @@ from app.tasks import (
     _PhaseTracker,
     _plan_images,
     _reconcile_scoped_vars_to_roster,
+    _require_ok,
     _scrub_nested_nones,
     _strip_file_vars,
     _tfstate_schema_name,
@@ -246,6 +248,55 @@ class TestSchemaName:
         out = _tfstate_schema_name("11111111-2222-3333-4444-555555555555")
         assert "-" not in out
         assert out.startswith("deployment_")
+
+
+@pytest.mark.unit
+class TestRequireOk:
+    """``_require_ok`` is the one place a failed CLI step is logged and raised."""
+
+    def test_returns_stdout_on_success(self):
+        """A successful step hands its stdout back and logs nothing."""
+        task_logger = mock.MagicMock()
+
+        assert (
+            _require_ok(
+                (True, "Apply complete!", ""), op="terraform_apply", task_logger=task_logger, error_message="boom"
+            )
+            == "Apply complete!"
+        )
+        task_logger.command_output.assert_not_called()
+        task_logger.error.assert_not_called()
+
+    def test_logs_both_streams_and_raises_on_failure(self):
+        """Both streams reach the per-deployment transcript before the raise."""
+        task_logger = mock.MagicMock()
+
+        with pytest.raises(Exception, match="Terraform init failed"):
+            _require_ok(
+                (False, "out", "err"),
+                op="terraform_init",
+                task_logger=task_logger,
+                error_message="Terraform init failed",
+            )
+
+        logged = {c.args[0]: c.args[1] for c in task_logger.command_output.call_args_list}
+        assert logged == {"terraform_init_stdout": "out", "terraform_init_stderr": "err"}
+        assert all(c.kwargs["returncode"] == 1 for c in task_logger.command_output.call_args_list)
+        task_logger.error.assert_called_once()
+
+    def test_skips_empty_streams(self):
+        """_stream_subprocess merges stderr into stdout, so stderr is often empty."""
+        task_logger = mock.MagicMock()
+
+        with pytest.raises(Exception, match="Terraform plan failed"):
+            _require_ok(
+                (False, "only stdout", ""),
+                op="terraform_plan",
+                task_logger=task_logger,
+                error_message="Terraform plan failed",
+            )
+
+        assert [c.args[0] for c in task_logger.command_output.call_args_list] == ["terraform_plan_stdout"]
 
 
 @pytest.mark.unit
