@@ -465,6 +465,73 @@ class TestDestroy:
         ok, _, _ = ex.destroy()
         assert ok is False
 
+    def test_destroy_retries_without_refresh_on_stale_data_source(self, mocker, tmp_path):
+        """A destroy blocked by a deleted data source retries with -refresh=false.
+
+        Terraform re-reads data sources on every destroy refresh, so an
+        image or network deleted out-of-band fails the refresh before any
+        managed resource is touched. The teardown must still proceed from
+        state. This policy used to live in destroy_deployment, where only
+        one of the four destroy paths inherited it.
+        """
+        stream = mocker.patch.object(
+            te_mod,
+            "_stream_subprocess",
+            side_effect=[
+                (1, "Error: Your query returned no results", ""),
+                (0, "Destroy complete!", ""),
+            ],
+        )
+        ex = TerraformExecutor(str(tmp_path))
+
+        ok, stdout, _ = ex.destroy(variables={"x": "9"})
+
+        assert ok is True
+        assert stream.call_count == 2
+        first_cmd, second_cmd = (c.args[0] for c in stream.call_args_list)
+        assert "-refresh=false" not in first_cmd
+        assert "-refresh=false" in second_cmd
+        # The variable set must survive into the retry, or the second
+        # attempt fails Terraform's variable validation instead.
+        assert "x=9" in second_cmd
+
+    def test_destroy_retries_at_most_once(self, mocker, tmp_path):
+        """If the -refresh=false attempt fails too, we surface it — no loop."""
+        stream = mocker.patch.object(
+            te_mod,
+            "_stream_subprocess",
+            side_effect=[
+                (1, "Your query returned no results", ""),
+                (1, "Your query returned no results", ""),
+            ],
+        )
+        ex = TerraformExecutor(str(tmp_path))
+
+        ok, _, _ = ex.destroy()
+
+        assert ok is False
+        assert stream.call_count == 2
+
+    def test_destroy_does_not_retry_on_unrelated_failure(self, mocker, tmp_path):
+        """Genuine destroy failures must still surface on the first attempt."""
+        stream = _patch_stream(mocker, returncode=1, stdout="Error: insufficient quota")
+        ex = TerraformExecutor(str(tmp_path))
+
+        ok, _, _ = ex.destroy()
+
+        assert ok is False
+        assert stream.call_count == 1
+
+    def test_destroy_retry_can_be_disabled(self, mocker, tmp_path):
+        """retry_without_refresh=False opts a caller out of the policy."""
+        stream = _patch_stream(mocker, returncode=1, stdout="Your query returned no results")
+        ex = TerraformExecutor(str(tmp_path))
+
+        ok, _, _ = ex.destroy(retry_without_refresh=False)
+
+        assert ok is False
+        assert stream.call_count == 1
+
     def test_destroy_exception(self, mocker, tmp_path):
         """An exception in destroy returns (False, "", message)."""
         mocker.patch.object(te_mod, "_stream_subprocess", side_effect=OSError("io"))

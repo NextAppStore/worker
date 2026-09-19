@@ -30,6 +30,15 @@ logger = get_logger(__name__)
 # `terraform { backend ... }` block in base config with this one.
 _PG_BACKEND_OVERRIDE_FILENAME = "pg_backend_override.tf"
 
+# A data source (e.g. a Glance image or network lookup) is re-read on every
+# destroy refresh. If that resource was deleted out-of-band the refresh fails
+# before any managed resource is touched, and the teardown is blocked by
+# something that is already gone. ``destroy`` retries once with
+# ``-refresh=false`` when it sees one of these markers, tearing down purely
+# from state. Scoped to these exact strings so genuine destroy failures
+# still surface.
+_STALE_DATA_SOURCE_MARKERS: tuple[str, ...] = ("Your query returned no results",)
+
 
 def _pg_backend_override_hcl(schema_name: str) -> str:
     # schema_name is interpolated, not user-controlled (we generate it from
@@ -45,6 +54,48 @@ Invoked once per line read from the subprocess. ``tool_name`` lets the
 callback distinguish ``terraform_init`` / ``terraform_plan`` / ... when one
 callback is shared across operations.
 """
+
+
+def var_flags(variables: dict[str, Any] | None) -> list[str]:
+    """Render a variable map as ``-var key=value`` CLI arguments.
+
+    Values arrive already encoded (see ``encode_terraform_vars`` /
+    ``encode_packer_vars`` in ``app.tasks``), so nothing is re-encoded
+    here — doing so a second time would double-escape JSON literals.
+    Passing flag and value as separate argv entries means quoting inside
+    an address or a JSON object reaches the tool unmodified.
+    """
+    flags: list[str] = []
+    for key, value in (variables or {}).items():
+        flags.extend(["-var", f"{key}={value}"])
+    return flags
+
+
+def run_buffered(
+    cmd: list[str],
+    *,
+    cwd: str | None = None,
+    env: dict[str, str],
+    timeout: int,
+) -> tuple[int, str, str]:
+    """Run a short command to completion and return ``(rc, stdout, stderr)``.
+
+    The buffered counterpart to :func:`_stream_subprocess`, for commands
+    fast enough that nobody needs live output (``terraform output``,
+    ``terraform state pull``, ``packer validate``, the ``openstack`` CLI).
+    Timeouts and a missing binary come back as ``rc == -1`` with the reason
+    in stderr, so callers never have to distinguish "failed" from "could
+    not start".
+    """
+    try:
+        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
+        return (result.returncode, result.stdout or "", result.stderr or "")
+    except subprocess.TimeoutExpired:
+        return (-1, "", f"Timeout after {timeout}s running: {' '.join(cmd)}")
+    except FileNotFoundError:
+        return (-1, "", f"Executable not found: {cmd[0]}")
+    except Exception as e:  # noqa: BLE001 — surfaced to the caller as stderr
+        return (-1, "", f"Error running {cmd[0]}: {e}")
 
 
 def _stream_subprocess(
@@ -255,9 +306,7 @@ class TerraformExecutor:
             cmd = [self.terraform_path, "plan", "-input=false", "-lock=false"]
             if var_file:
                 cmd.extend(["-var-file", var_file])
-            if variables:
-                for key, value in variables.items():
-                    cmd.extend(["-var", f"{key}={value}"])
+            cmd.extend(var_flags(variables))
 
             logger.info("Analyzing Terraform configuration...", category=LogCategory.STATUS)
             logger.debug("plan variable keys", category=LogCategory.OPERATION, keys=list((variables or {}).keys()))
@@ -319,9 +368,7 @@ class TerraformExecutor:
             cmd = [self.terraform_path, "apply", "-auto-approve", "-input=false", "-lock=false"]
             if var_file:
                 cmd.extend(["-var-file", var_file])
-            if variables:
-                for key, value in variables.items():
-                    cmd.extend(["-var", f"{key}={value}"])
+            cmd.extend(var_flags(variables))
             # Targets / replaces must be a plain list of addresses; we
             # don't validate the shape here (the caller has already
             # whitelisted against the cached TF state). Passing them as
@@ -352,18 +399,31 @@ class TerraformExecutor:
             logger.operation_end("terraform_apply", success=False)
             return False, "", str(e)
 
+    @staticmethod
+    def _is_stale_data_source_failure(stdout: str, stderr: str) -> bool:
+        """True if a destroy failed only because a data source is stale."""
+        haystack = f"{stdout or ''}{stderr or ''}"
+        return any(marker in haystack for marker in _STALE_DATA_SOURCE_MARKERS)
+
     def destroy(
         self,
         var_file: str | None = None,
         variables: dict[str, Any] | None = None,
         refresh: bool = True,
+        retry_without_refresh: bool = True,
     ) -> tuple[bool, str, str]:
         """Run terraform destroy.
 
         ``refresh=False`` adds ``-refresh=false`` so Terraform tears down
-        purely from state without re-reading data sources. Only used as a
-        targeted fallback by the worker when a stale data source (e.g. a
-        Glance image deleted out-of-band) blocks the refresh-based destroy.
+        purely from state without re-reading data sources.
+
+        ``retry_without_refresh`` (default on) retries the destroy exactly
+        once with ``-refresh=false`` when the first attempt failed on a
+        stale data source. This used to live in ``destroy_deployment``, so
+        only that one of the four destroy paths got it — the cleanup
+        destroy in deploy's error path, which is the more likely place to
+        meet a half-built graph, did not. Owning the policy here means
+        every caller inherits it.
         """
         logger.operation_start("terraform_destroy", var_file=var_file, var_count=len(variables or {}))
         try:
@@ -374,9 +434,7 @@ class TerraformExecutor:
                 cmd.append("-refresh=false")
             if var_file:
                 cmd.extend(["-var-file", var_file])
-            if variables:
-                for key, value in variables.items():
-                    cmd.extend(["-var", f"{key}={value}"])
+            cmd.extend(var_flags(variables))
 
             logger.info("Destroying Terraform resources (this may take minutes)...", category=LogCategory.STATUS)
 
@@ -389,6 +447,21 @@ class TerraformExecutor:
                 logger.error("Terraform destroy failed", category=LogCategory.ERROR)
             else:
                 logger.success("Terraform destroy completed successfully", category=LogCategory.STATUS)
+
+            if not success and refresh and retry_without_refresh and self._is_stale_data_source_failure(stdout, stderr):
+                logger.warning(
+                    "Destroy blocked by a stale data source (image/network deleted "
+                    "out-of-band). Retrying with -refresh=false — resources are torn "
+                    "down from state.",
+                    category=LogCategory.OPERATION,
+                )
+                logger.operation_end("terraform_destroy", success=False)
+                return self.destroy(
+                    var_file=var_file,
+                    variables=variables,
+                    refresh=False,
+                    retry_without_refresh=False,
+                )
 
             logger.operation_end("terraform_destroy", success)
             return success, stdout, stderr
@@ -408,17 +481,15 @@ class TerraformExecutor:
         try:
             cmd = [self.terraform_path, "output", "-json"]
             logger.debug(f"[TF] Running command: {' '.join(cmd)}")
-            result = subprocess.run(
-                cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=60, env=self._get_env()
-            )
-            if result.returncode != 0:
+            returncode, stdout, _stderr = run_buffered(cmd, cwd=self.working_dir, env=self._get_env(), timeout=60)
+            if returncode != 0:
                 logger.warning(
-                    "Terraform output retrieval failed", category=LogCategory.OPERATION, returncode=result.returncode
+                    "Terraform output retrieval failed", category=LogCategory.OPERATION, returncode=returncode
                 )
                 logger.operation_end("terraform_output", success=False)
                 return None
 
-            outputs = json.loads(result.stdout)
+            outputs = json.loads(stdout)
             logger.success(f"Terraform outputs retrieved ({len(outputs)} outputs)", category=LogCategory.STATUS)
             logger.operation_end("terraform_output", success=True)
             return outputs
@@ -437,22 +508,15 @@ class TerraformExecutor:
         """
         try:
             cmd = [self.terraform_path, "state", "pull"]
-            result = subprocess.run(
-                cmd,
-                cwd=self.working_dir,
-                capture_output=True,
-                text=True,
-                timeout=60,
-                env=self._get_env(),
-            )
-            if result.returncode != 0:
+            returncode, stdout, _stderr = run_buffered(cmd, cwd=self.working_dir, env=self._get_env(), timeout=60)
+            if returncode != 0:
                 logger.warning(
                     "Terraform state pull failed",
                     category=LogCategory.OPERATION,
-                    returncode=result.returncode,
+                    returncode=returncode,
                 )
                 return None
-            return result.stdout
+            return stdout
         except Exception as e:
             logger.warning(f"Terraform state pull raised: {e}", category=LogCategory.OPERATION)
             return None
