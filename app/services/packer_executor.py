@@ -44,18 +44,7 @@ class PackerExecutor:
         env.update(self.env_vars)
         if extra_env:
             env.update(extra_env)
-        # ``PACKER_LOG=1`` turns on Packer's TRACE logging, which inflates
-        # build output by roughly 10-50x. Every one of those lines is then
-        # buffered, written to the console and published to the event bus
-        # per line — and ``_extract_error_from_packer`` filters the very
-        # same ``[TRACE]``/``[DEBUG]`` lines back out when it looks for the
-        # real error. Default to off and opt back in via ``WORKER_PACKER_LOG``,
-        # mirroring how ``TerraformExecutor._get_env`` handles ``TF_LOG``.
-        packer_log = os.environ.get("WORKER_PACKER_LOG", "")
-        if packer_log:
-            env["PACKER_LOG"] = packer_log
-        else:
-            env.pop("PACKER_LOG", None)
+        env["PACKER_LOG"] = "1"
         return env
 
     def init(self) -> tuple[bool, str, str]:

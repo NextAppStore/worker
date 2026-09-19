@@ -108,26 +108,10 @@ class TestPackerInit:
         assert call["tool_name"] == "packer_init"
         assert call["timeout"] == 300
 
-    def test_init_env_has_no_packer_log_by_default(self, mocker, executor):
-        """init leaves PACKER_LOG unset unless WORKER_PACKER_LOG asks for it.
-
-        PACKER_LOG=1 is Packer's TRACE level and inflates build output by
-        10-50x; every line is buffered, consoled and published per line.
-        Mirrors how TerraformExecutor gates TF_LOG.
-        """
+    def test_init_env_has_packer_log_enabled(self, mocker, executor):
+        """init exports PACKER_LOG=1 in the subprocess environment."""
         recorder = StreamRecorder(returncode=0)
         mocker.patch("app.services.packer_executor._stream_subprocess", recorder)
-        mocker.patch.dict("os.environ", {"PACKER_LOG": "1"}, clear=False)
-
-        executor.init()
-
-        assert "PACKER_LOG" not in recorder.calls[0]["env"]
-
-    def test_init_env_honours_worker_packer_log_opt_in(self, mocker, executor):
-        """WORKER_PACKER_LOG is passed through verbatim as PACKER_LOG."""
-        recorder = StreamRecorder(returncode=0)
-        mocker.patch("app.services.packer_executor._stream_subprocess", recorder)
-        mocker.patch.dict("os.environ", {"WORKER_PACKER_LOG": "1"}, clear=False)
 
         executor.init()
 
@@ -264,13 +248,13 @@ class TestPackerValidate:
         assert stdout == ""
         assert stderr  # str(exception) is non-empty
 
-    def test_validate_env_has_no_packer_log_by_default(self, mocker, executor):
-        """validate's subprocess env leaves PACKER_LOG unset by default."""
+    def test_validate_env_has_packer_log_enabled(self, mocker, executor):
+        """validate's subprocess env contains PACKER_LOG=1."""
         run = mocker.patch("app.services.packer_executor.subprocess.run", return_value=self._make_completed())
 
         executor.validate("template.pkr.hcl")
 
-        assert "PACKER_LOG" not in run.call_args.kwargs["env"]
+        assert run.call_args.kwargs["env"]["PACKER_LOG"] == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +370,7 @@ class TestPackerBuild:
         env = recorder.calls[0]["env"]
         assert env["FROM_INIT"] == "1"
         assert env["EXTRA"] == "yes"
-        assert "PACKER_LOG" not in env
+        assert env["PACKER_LOG"] == "1"
 
     def test_build_exception_returns_false_with_message(self, mocker, executor):
         """build catches exceptions and returns (False, str(e))."""

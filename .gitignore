@@ -112,3 +112,6 @@ worker_repos/
 # -----------------------------------------------------------------------------
 .DS_Store
 Thumbs.db
+
+# local characterization harness (behaviour diff vs main); not part of the build
+.charharness/

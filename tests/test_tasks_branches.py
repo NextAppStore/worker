@@ -282,6 +282,23 @@ class TestRequireOk:
         logged = {c.args[0]: c.args[1] for c in task_logger.command_output.call_args_list}
         assert logged == {"terraform_init_stdout": "out", "terraform_init_stderr": "err"}
         assert all(c.kwargs["returncode"] == 1 for c in task_logger.command_output.call_args_list)
+        # No separate ERROR entry by default: only deploy's terraform steps
+        # emitted one, and the transcript is user-visible.
+        task_logger.error.assert_not_called()
+
+    def test_log_error_adds_a_separate_error_entry(self):
+        """log_error=True reproduces what deploy's terraform steps do."""
+        task_logger = mock.MagicMock()
+
+        with pytest.raises(Exception, match="Terraform apply failed"):
+            _require_ok(
+                (False, "out", ""),
+                op="terraform_apply",
+                task_logger=task_logger,
+                error_message="Terraform apply failed",
+                log_error=True,
+            )
+
         task_logger.error.assert_called_once()
 
     def test_skips_empty_streams(self):

@@ -492,20 +492,29 @@ class _ImagePlan:
         Legacy apps use a flat ``user_vars["packer"][var]``; multi-image
         apps nest one level deeper under the template key.
         """
-        packer = user_vars.get("packer") or {}
         if self.is_legacy:
-            return dict(packer)
-        return dict(packer.get(self.key) or {})
+            return {**user_vars.get("packer", {})}
+        return {**((user_vars.get("packer") or {}).get(self.key, {}) or {})}
 
 
-def _plan_images(templates: list[_PackerTemplate]) -> list[_ImagePlan]:
+def _plan_images(templates: list[_PackerTemplate], *, legacy_fallback: bool = False) -> list[_ImagePlan]:
     """Normalise the discovered templates into one plan per image.
 
-    The single place the legacy/multi distinction is interpreted. An app
-    with no Packer template yields no plans at all — and therefore no
-    ``image_name`` variable, which is correct: such an app declares none,
-    and ``terraform -var`` on an undeclared variable is a hard error.
+    The single place the legacy/multi distinction is interpreted.
+
+    ``legacy_fallback`` reproduces a pre-existing asymmetry between the
+    tasks, deliberately: with no Packer template at all, deploy injects no
+    image variable, while destroy and redeploy inject a flat
+    ``image_name=<app_id>-<tag>``. Only destroy and redeploy pass
+    ``legacy_fallback=True``. The two behaviours are not obviously both
+    right — an app with no Packer declares no ``image_name``, and
+    ``terraform -var`` on an undeclared variable is an error — but
+    changing either is a behaviour change, not a refactor, so the split is
+    preserved and named here rather than left implicit in two spellings of
+    a predicate.
     """
+    if not templates and legacy_fallback:
+        return [_ImagePlan(key="default", is_legacy=True)]
     legacy = _is_legacy_layout(templates)
     return [_ImagePlan(key=t.key, is_legacy=legacy) for t in templates]
 
@@ -522,6 +531,7 @@ def _require_ok(
     op: str,
     task_logger: Any,
     error_message: str,
+    log_error: bool = False,
 ) -> str:
     """Return a CLI step's stdout, or log its output and raise.
 
@@ -541,7 +551,11 @@ def _require_ok(
     for stream_name, text in (("stdout", stdout), ("stderr", stderr)):
         if text:
             task_logger.command_output(f"{op}_{stream_name}", text, returncode=1)
-    task_logger.error(error_message, category=LogCategory.ERROR)
+    # Only deploy's terraform steps emit a separate ERROR entry on top of
+    # the command output; the other call sites never did, and the
+    # transcript is user-visible, so the difference is preserved.
+    if log_error:
+        task_logger.error(error_message, category=LogCategory.ERROR)
     raise Exception(error_message)
 
 
@@ -642,7 +656,11 @@ class _TaskContext:
             "logs": self.task_logger.get_logs_dict(),
             "tf_state": tf_state,
             "commit_info": commit_info,
-            "terraform_outputs": outputs if outputs is not None else {},
+            # Passed through verbatim: deploy reports ``None`` when the
+            # output collection itself failed, which is distinguishable
+            # from "applied but declared no outputs" ({}). The backend
+            # persists the difference.
+            "terraform_outputs": outputs,
         }
 
 
@@ -683,8 +701,11 @@ def _task_preamble(
     app_git_link: str,
     release: str,
     openstack_envelope: dict[str, Any] | None,
-    action: str,
-    want_commit_info: bool = True,
+    envelope_error: str,
+    clone_message: str,
+    clone_detail: str | None = None,
+    commit_info_mode: str = "full",
+    frame_creds_operation: bool = False,
 ) -> None:
     """The four opening phases every lifecycle task shares.
 
@@ -696,51 +717,60 @@ def _task_preamble(
     Cleanup for both the clone and the credential file is registered on
     ``ctx.stack`` as it is acquired, so a failure half-way through still
     tears down exactly what was created.
+
+    The message parameters exist because the four tasks word these phases
+    differently and the transcript is user-visible — this helper unifies
+    the control flow, not the wording. ``commit_info_mode`` is
+    ``"full"`` (resource_info + success line, as deploy and destroy do),
+    ``"success_only"`` (redeploy) or ``"none"`` (pause/resume, which never
+    look at the commit).
     """
     ctx.mark(PHASE_OPENSTACK_SETUP, "Validating OpenStack credentials")
     if not openstack_envelope:
-        raise Exception(f"OpenStack credential envelope missing — cannot {action} without credentials")
+        raise Exception(envelope_error)
     ctx.task_logger.success("OpenStack credential envelope received", category=LogCategory.STATUS)
 
-    ctx.mark(PHASE_GIT_CLONE, "Cloning repository at the release tag")
-    ctx.task_logger.info(
-        f"Cloning {app_git_link} at {release} (same ref as the original deploy "
-        "so terraform code matches the pg-backend state)",
-        category=LogCategory.OPERATION,
-    )
+    ctx.mark(PHASE_GIT_CLONE, clone_message)
+    if clone_detail:
+        ctx.task_logger.info(clone_detail, category=LogCategory.OPERATION)
     try:
         ctx.repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=ctx.deployment_id, tag=release)
     except Exception as e:
         raise Exception(f"Git clone failed: {str(e)}")
     ctx.stack.callback(_cleanup_repository, ctx.repo_path, ctx.task_logger)
 
-    if want_commit_info:
+    if commit_info_mode == "none":
+        ctx.task_logger.success("Repository cloned", category=LogCategory.STATUS)
+    else:
         # A repo without a readable HEAD degrades to a warning: the commit
         # metadata is for display and image-cache keying, not correctness.
         try:
             ctx.commit_info = _extract_commit_info(ctx.repo_path)
-            ctx.task_logger.resource_info(
-                "git_commit",
-                ctx.commit_info["hash"][:8],
-                hash=ctx.commit_info["hash"],
-                message=ctx.commit_info["message"],
-                author=ctx.commit_info["author"],
-            )
+            if commit_info_mode == "full":
+                ctx.task_logger.resource_info(
+                    "git_commit",
+                    ctx.commit_info["hash"][:8],
+                    hash=ctx.commit_info["hash"],
+                    message=ctx.commit_info["message"],
+                    author=ctx.commit_info["author"],
+                )
             ctx.task_logger.success(
                 f"Repository cloned at commit {ctx.commit_info['hash'][:8]}",
                 category=LogCategory.STATUS,
             )
         except Exception as e:
             ctx.task_logger.warning(f"Could not extract commit info: {e}", category=LogCategory.WARNING)
-    else:
-        ctx.task_logger.success("Repository cloned", category=LogCategory.STATUS)
 
     ctx.mark(PHASE_CREDS_MATERIALISE, "Writing per-task clouds.yaml")
+    if frame_creds_operation:
+        ctx.task_logger.operation_start("openstack_credentials_materialise")
     # Registered after the repo cleanup, so LIFO shreds the credential
     # file first — even if removing the clone then fails or hangs.
     ctx.openstack_env = ctx.stack.enter_context(
         _shredding_clouds_config(openstack_envelope, ctx.repo_path, ctx.task_logger)
     )
+    if frame_creds_operation:
+        ctx.task_logger.operation_end("openstack_credentials_materialise", success=True)
     ctx.task_logger.success("Per-task clouds.yaml written", category=LogCategory.STATUS)
 
 
@@ -773,7 +803,7 @@ def _cleanup_repository(repo_path: str | None, task_logger: Any) -> None:
 
 
 def _terraform_var_set(
-    user_vars: dict[str, Any],
+    raw: dict[str, Any],
     *,
     plans: list[_ImagePlan],
     app_id: str,
@@ -797,8 +827,11 @@ def _terraform_var_set(
     ``transform`` is an optional hook applied to the raw var-set before
     the image names go in — redeploy uses it to reconcile scoped
     variables against the current roster.
+
+    ``raw`` is passed in rather than extracted from ``user_vars`` here
+    because the call sites do not agree on how to extract it, and the
+    difference is observable for a present-but-``None`` value.
     """
-    raw = dict(user_vars.get("terraform") or {})
     if strip_files:
         raw = _strip_file_vars(raw)
     if transform is not None:
@@ -809,7 +842,9 @@ def _terraform_var_set(
     return encode_terraform_vars(raw)
 
 
-def _discover_image_plans(ctx: _TaskContext, app_id: str, release: str) -> tuple[list[_ImagePlan], str]:
+def _discover_image_plans(
+    ctx: _TaskContext, app_id: str, release: str, *, legacy_fallback: bool = False
+) -> tuple[list[_ImagePlan], str]:
     """Discover the packer layout and resolve it into image plans.
 
     Deploy uses the result to build the images; destroy and redeploy use
@@ -820,7 +855,7 @@ def _discover_image_plans(ctx: _TaskContext, app_id: str, release: str) -> tuple
         templates = _discover_packer_templates(ctx.repo_path)
     except PackerTemplateDiscoveryError as e:
         raise Exception(f"Packer template discovery failed: {e}")
-    return _plan_images(templates), _image_tag(ctx.commit_info, release)
+    return _plan_images(templates, legacy_fallback=legacy_fallback), _image_tag(ctx.commit_info, release)
 
 
 def _raise_failure(
@@ -832,6 +867,7 @@ def _raise_failure(
     outputs: dict[str, Any] | None = None,
     commit_info: dict[str, Any] | None = None,
     collect_state: bool = True,
+    local_fallback: bool = False,
 ) -> NoReturn:
     """Log the failure and re-raise it as the ``Failure`` the backend parses.
 
@@ -840,15 +876,15 @@ def _raise_failure(
     failure debuggable in the UI.
     """
     ctx.task_logger.exception(f"{verb} failed: {str(error)}", exception=error, deployment_id=ctx.deployment_id)
-    if tf_state is None and collect_state:
-        tf_state = ctx.collect_state()
+    if not tf_state and collect_state:
+        tf_state = ctx.collect_state(local_fallback=local_fallback)
     raise Failure(
         message=str(error),
         deployment_id=ctx.deployment_id,
         logs_dict=ctx.task_logger.get_logs_dict(),
         tf_state=tf_state,
-        commit_info=commit_info if commit_info is not None else ctx.commit_info,
-        terraform_outputs=outputs if outputs is not None else {},
+        commit_info=commit_info,
+        terraform_outputs=outputs,
     )
 
 
@@ -976,7 +1012,7 @@ def _build_one_packer_image(
                 )
                 break
     except Exception as e:
-        raise Exception(f"Packer error: {str(e)}") from e
+        raise Exception(f"Packer error: {str(e)}")
 
 
 def _packer_step(
@@ -1064,7 +1100,7 @@ def _cleanup_partial_apply(
         )
         terraform.destroy(
             variables=_terraform_var_set(
-                user_vars,
+                user_vars.get("terraform") or {},
                 plans=plans,
                 app_id=app_id,
                 image_tag=image_tag,
@@ -1104,7 +1140,8 @@ def deploy_application(
     Returns:
         dict: status, deployment_id, logs, tf_state, commit_info, terraform_outputs
     """
-    teams = teams or {}
+    if teams is None:
+        teams = {}
     # Pessimistic phase set — assumes Packer. Narrowed once the clone
     # reveals whether the repo actually has a template.
     with _task_context(self, deployment_id, "deploy", _PHASES_WITH_PACKER) as ctx:
@@ -1127,7 +1164,12 @@ def deploy_application(
                 app_git_link=app_git_link,
                 release=release,
                 openstack_envelope=openstack_envelope,
-                action="deploy",
+                envelope_error=(
+                    "OpenStack credential envelope missing — user must upload credentials before deploying"
+                ),
+                clone_message="Cloning repository",
+                clone_detail=f"Cloning repository: {app_git_link}",
+                frame_creds_operation=True,
             )
 
             # The image is cached by commit SHA, not release tag: `release`
@@ -1157,12 +1199,13 @@ def deploy_application(
                     op="terraform_init",
                     task_logger=ctx.task_logger,
                     error_message="Terraform init failed",
+                    log_error=True,
                 )
                 ctx.task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
 
                 # File vars are kept here: apply consumes them via cloud-init.
                 terraform_vars = _terraform_var_set(
-                    user_vars,
+                    {**user_vars["terraform"]} if "terraform" in user_vars else {},
                     plans=plans,
                     app_id=app_id,
                     image_tag=image_tag,
@@ -1181,6 +1224,7 @@ def deploy_application(
                     op="terraform_plan",
                     task_logger=ctx.task_logger,
                     error_message="Terraform plan failed",
+                    log_error=True,
                 )
                 ctx.task_logger.success("Terraform plan completed successfully", category=LogCategory.STATUS)
 
@@ -1190,6 +1234,7 @@ def deploy_application(
                     op="terraform_apply",
                     task_logger=ctx.task_logger,
                     error_message="Terraform apply failed",
+                    log_error=True,
                 )
                 ctx.task_logger.success("Terraform resources created", category=LogCategory.STATUS)
 
@@ -1232,7 +1277,17 @@ def deploy_application(
             return ctx.result(tf_state=tf_state, outputs=outputs, commit_info=ctx.commit_info)
 
         except Exception as e:
-            _raise_failure(ctx, e, verb="Deployment", tf_state=tf_state, outputs=outputs)
+            if not outputs:
+                outputs = ctx.collect_outputs()
+            _raise_failure(
+                ctx,
+                e,
+                verb="Deployment",
+                tf_state=tf_state,
+                outputs=outputs,
+                commit_info=ctx.commit_info,
+                local_fallback=True,
+            )
 
 
 @celery_app.task(bind=True, name="tasks.destroy_deployment")
@@ -1258,7 +1313,8 @@ def destroy_deployment(
     Args mirror ``deploy_application`` so the backend can re-dispatch the
     same persisted values without translation.
     """
-    teams = teams or {}
+    if teams is None:
+        teams = {}
     with _task_context(self, deployment_id, "destroy", _PHASES_DESTROY) as ctx:
         try:
             ctx.mark(PHASE_STARTING, "Starting destroy")
@@ -1278,13 +1334,18 @@ def destroy_deployment(
                 app_git_link=app_git_link,
                 release=release,
                 openstack_envelope=openstack_envelope,
-                action="destroy",
+                envelope_error="OpenStack credential envelope missing — cannot destroy without credentials",
+                clone_message="Cloning repository at original release tag",
+                clone_detail=(
+                    f"Cloning {app_git_link} at {release} (same ref as the original deploy "
+                    "so terraform code matches the pg-backend state)"
+                ),
             )
 
-            plans, image_tag = _discover_image_plans(ctx, app_id, release)
+            plans, image_tag = _discover_image_plans(ctx, app_id, release, legacy_fallback=True)
             ctx.require_terraform_dir()
             terraform_vars = _terraform_var_set(
-                user_vars,
+                {**user_vars["terraform"]} if "terraform" in user_vars else {},
                 plans=plans,
                 app_id=app_id,
                 image_tag=image_tag,
@@ -1304,11 +1365,23 @@ def destroy_deployment(
             ctx.task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
 
             ctx.mark(PHASE_TERRAFORM_DESTROY, "Destroying resources")
-            # The stale-data-source retry (-refresh=false when a deleted
-            # image/network blocks the refresh) lives in
-            # TerraformExecutor.destroy, so every destroy path inherits it.
+            success, stdout, stderr = terraform.destroy(variables=terraform_vars)
+            # A data source (e.g. the Glance image lookup) is re-read on every
+            # destroy refresh. If that image/network was deleted out-of-band,
+            # the refresh fails with "Your query returned no results" before any
+            # managed resource is touched. Retry once with -refresh=false so the
+            # teardown proceeds purely from state. Scoped to this exact error so
+            # genuine destroy failures still surface.
+            if not success and "Your query returned no results" in f"{stdout or ''}{stderr or ''}":
+                ctx.task_logger.warning(
+                    "Destroy blocked by a stale data source (image/network deleted "
+                    "out-of-band). Retrying with -refresh=false — resources are torn "
+                    "down from state.",
+                    category=LogCategory.WARNING,
+                )
+                success, stdout, stderr = terraform.destroy(variables=terraform_vars, refresh=False)
             _require_ok(
-                terraform.destroy(variables=terraform_vars),
+                (success, stdout, stderr),
                 op="terraform_destroy",
                 task_logger=ctx.task_logger,
                 error_message="Terraform destroy failed",
@@ -1323,10 +1396,10 @@ def destroy_deployment(
 
             # No outputs — destroy doesn't produce any. The field stays for
             # event-listener parity with deploy_application's payload.
-            return ctx.result(tf_state=tf_state, commit_info=ctx.commit_info)
+            return ctx.result(tf_state=tf_state, commit_info=ctx.commit_info, outputs={})
 
         except Exception as e:
-            _raise_failure(ctx, e, verb="Destroy")
+            _raise_failure(ctx, e, verb="Destroy", outputs={}, commit_info=ctx.commit_info)
 
 
 # ----------------------------------------------------------------
@@ -1399,7 +1472,8 @@ def _run_compute_lifecycle(
     servers failed, so the user sees "stopped 4/5; failed: web-1: locked
     task" rather than an unqualified "pause failed".
     """
-    teams = teams or {}
+    if teams is None:
+        teams = {}
     with _task_context(bound_task, deployment_id, action, phases) as ctx:
         try:
             ctx.mark(PHASE_STARTING, f"Starting {action}")
@@ -1419,8 +1493,9 @@ def _run_compute_lifecycle(
                 app_git_link=app_git_link,
                 release=release,
                 openstack_envelope=openstack_envelope,
-                action=action,
-                want_commit_info=False,
+                envelope_error=f"OpenStack credential envelope missing — cannot {action} without credentials",
+                clone_message="Cloning repository at original release tag",
+                commit_info_mode="none",
             )
 
             ctx.require_terraform_dir()
@@ -1486,13 +1561,13 @@ def _run_compute_lifecycle(
             )
             # Pause/resume neither generate nor change terraform outputs;
             # the field stays for event-listener parity.
-            return ctx.result(tf_state=tf_state_post, commit_info=None)
+            return ctx.result(tf_state=tf_state_post, commit_info=None, outputs={})
 
         except Exception as e:
             # Unlike the other three tasks, no state snapshot is pulled on
             # failure here: pause/resume never modify state, so a snapshot
             # would only cost another subprocess on the error path.
-            _raise_failure(ctx, e, verb=action, collect_state=False)
+            _raise_failure(ctx, e, verb=action, collect_state=False, outputs={}, commit_info=None)
 
 
 def _apply_server_op(
@@ -1769,7 +1844,8 @@ def redeploy_resource(
     Returns the same payload shape as deploy/destroy so the celery event
     listener stays generic.
     """
-    teams = teams or {}
+    if teams is None:
+        teams = {}
     with _task_context(self, deployment_id, "redeploy", _PHASES_REDEPLOY) as ctx:
         tf_state: str | None = None
         outputs: dict[str, Any] | None = None
@@ -1798,10 +1874,16 @@ def redeploy_resource(
                 app_git_link=app_git_link,
                 release=release,
                 openstack_envelope=openstack_envelope,
-                action="redeploy",
+                envelope_error="OpenStack credential envelope missing — cannot redeploy without credentials",
+                clone_message="Cloning repository at original release tag",
+                clone_detail=(
+                    f"Cloning {app_git_link} at {release} (same ref as the original deploy "
+                    "so terraform code matches the pg-backend state)"
+                ),
+                commit_info_mode="success_only",
             )
 
-            plans, image_tag = _discover_image_plans(ctx, app_id, release)
+            plans, image_tag = _discover_image_plans(ctx, app_id, release, legacy_fallback=True)
             ctx.require_terraform_dir()
 
             # File variables are KEPT here: ``apply -replace`` recreates the
@@ -1811,7 +1893,7 @@ def redeploy_resource(
             # scoped variables are reconciled against the current roster
             # first — otherwise terraform chokes on orphan slot keys.
             terraform_vars = _terraform_var_set(
-                user_vars,
+                {**user_vars["terraform"]} if "terraform" in user_vars else {},
                 plans=plans,
                 app_id=app_id,
                 image_tag=image_tag,
@@ -1854,7 +1936,9 @@ def redeploy_resource(
                 f"Deployment {deployment_id} redeploy of {resource_address} completed",
                 category=LogCategory.STATUS,
             )
-            return ctx.result(tf_state=tf_state, outputs=outputs, commit_info=ctx.commit_info)
+            return ctx.result(tf_state=tf_state, outputs=outputs or {}, commit_info=ctx.commit_info)
 
         except Exception as e:
-            _raise_failure(ctx, e, verb="Redeploy", tf_state=tf_state, outputs=outputs)
+            _raise_failure(
+                ctx, e, verb="Redeploy", tf_state=tf_state, outputs=outputs or {}, commit_info=ctx.commit_info
+            )
