@@ -23,7 +23,7 @@ from app.tasks import (
     _apply_image_name_vars,
     _build_current_roster,
     _looks_like_file_var_value,
-    _phases_for_templates,
+    _phases_for_plans,
     _PhaseTracker,
     _plan_images,
     _reconcile_scoped_vars_to_roster,
@@ -381,18 +381,18 @@ class TestPhasesForTemplates:
 
     def test_empty_templates_drops_packer_block(self):
         """No template → ``_PHASES_WITHOUT_PACKER`` (no packer phases at all)."""
-        phases = _phases_for_templates([])
+        phases = _phases_for_plans(_plan_images([]))
         assert "PACKER_INIT" not in phases
         assert "PACKER_BUILD" not in phases
 
     def test_legacy_single_default_template_uses_unsuffixed_phases(self):
         """A single ``default`` template uses the legacy unsuffixed phase names."""
-        phases = _phases_for_templates([_FakeTemplate("default")])
+        phases = _phases_for_plans(_plan_images([_FakeTemplate("default")]))
         assert phases == _PHASES_WITH_PACKER
 
     def test_multi_template_emits_suffixed_phases_per_template(self):
         """Multi-template repos get one ``PACKER_*:<key>`` trio per template."""
-        phases = _phases_for_templates([_FakeTemplate("web"), _FakeTemplate("db")])
+        phases = _phases_for_plans(_plan_images([_FakeTemplate("web"), _FakeTemplate("db")]))
         assert "PACKER_INIT:web" in phases
         assert "PACKER_BUILD:db" in phases
         # Order is preserved as caller passed.
