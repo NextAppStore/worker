@@ -19,10 +19,12 @@ import pytest
 from app.tasks import (
     _PHASES_WITH_PACKER,
     Failure,
+    _apply_image_name_vars,
     _build_current_roster,
     _looks_like_file_var_value,
     _phases_for_templates,
     _PhaseTracker,
+    _plan_images,
     _reconcile_scoped_vars_to_roster,
     _scrub_nested_nones,
     _strip_file_vars,
@@ -244,6 +246,82 @@ class TestSchemaName:
         out = _tfstate_schema_name("11111111-2222-3333-4444-555555555555")
         assert "-" not in out
         assert out.startswith("deployment_")
+
+
+@pytest.mark.unit
+class TestImagePlanNormalisation:
+    """``_plan_images`` is the single place the packer layout is interpreted."""
+
+    def test_legacy_single_default_template_keeps_flat_names(self):
+        """The flat ``packer/`` layout gets unsuffixed names everywhere."""
+        (plan,) = _plan_images([_FakeTemplate("default")])
+
+        assert plan.is_legacy is True
+        assert plan.image_name("myapp", "abc1234") == "myapp-abc1234"
+        assert plan.terraform_var_name == "image_name"
+        assert plan.log_prefix == ""
+        assert plan.phase_names == ("PACKER_INIT", "PACKER_VALIDATE", "PACKER_BUILD")
+        assert plan.packer_dir("/repo") == os.path.join("/repo", "packer")
+
+    def test_multi_template_layout_suffixes_every_name_by_key(self):
+        """Each template gets its own image, variable, phases and directory."""
+        plans = _plan_images([_FakeTemplate("web"), _FakeTemplate("db")])
+
+        assert [p.key for p in plans] == ["web", "db"]
+        web = plans[0]
+        assert web.is_legacy is False
+        assert web.image_name("myapp", "abc1234") == "myapp-web-abc1234"
+        assert web.terraform_var_name == "image_name_web"
+        assert web.log_prefix == "[web] "
+        assert web.phase_names == ("PACKER_INIT:web", "PACKER_VALIDATE:web", "PACKER_BUILD:web")
+        assert web.packer_dir("/repo") == os.path.join("/repo", "packer", "web")
+
+    def test_no_templates_yields_no_plans_and_no_image_variable(self):
+        """An app without Packer declares no ``image_name`` — so we inject none.
+
+        ``terraform -var`` on an undeclared variable is a hard error, so
+        injecting a flat ``image_name`` here (as destroy/redeploy used to)
+        could only ever work by accident.
+        """
+        assert _plan_images([]) == []
+
+        target: dict = {}
+        _apply_image_name_vars(target, _plan_images([]), "myapp", "abc1234")
+        assert target == {}
+
+    def test_apply_injects_one_variable_per_plan(self):
+        """Multi-image apps get one ``image_name_<key>`` per template."""
+        target: dict = {}
+        _apply_image_name_vars(target, _plan_images([_FakeTemplate("web"), _FakeTemplate("db")]), "myapp", "t1")
+
+        assert target == {"image_name_web": "myapp-web-t1", "image_name_db": "myapp-db-t1"}
+
+    def test_user_packer_vars_nesting_follows_the_layout(self):
+        """Legacy reads the flat slice; multi reads the per-key slice."""
+        user_vars = {"packer": {"flavor": "m1.small", "web": {"flavor": "m1.large"}}}
+
+        (legacy,) = _plan_images([_FakeTemplate("default")])
+        assert legacy.user_packer_vars(user_vars)["flavor"] == "m1.small"
+
+        web = _plan_images([_FakeTemplate("web"), _FakeTemplate("db")])[0]
+        assert web.user_packer_vars(user_vars) == {"flavor": "m1.large"}
+
+    def test_user_packer_vars_tolerates_missing_slices(self):
+        """No ``packer`` key at all, or no slice for this template, is empty."""
+        (legacy,) = _plan_images([_FakeTemplate("default")])
+        assert legacy.user_packer_vars({}) == {}
+
+        db = _plan_images([_FakeTemplate("web"), _FakeTemplate("db")])[1]
+        assert db.user_packer_vars({"packer": {"web": {"a": 1}}}) == {}
+
+    def test_returned_slice_is_a_copy(self):
+        """Mutating the returned vars must not write back into user_vars."""
+        user_vars = {"packer": {"flavor": "m1.small"}}
+        (legacy,) = _plan_images([_FakeTemplate("default")])
+
+        legacy.user_packer_vars(user_vars)["image_name"] = "injected"
+
+        assert user_vars == {"packer": {"flavor": "m1.small"}}
 
 
 @pytest.mark.unit

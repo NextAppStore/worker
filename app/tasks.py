@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from dataclasses import dataclass
 from typing import Any
 
 import git
@@ -489,47 +490,85 @@ def _image_tag(commit_info: dict[str, Any] | None, release: str) -> str:
     return commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
 
 
-def _build_image_names(templates: list[_PackerTemplate], app_id: str, image_tag: str) -> dict[str, str]:
-    """Reconstruct the per-template Glance image-name map.
+@dataclass(frozen=True)
+class _ImagePlan:
+    """Every per-template decision, resolved once from the discovered layout.
 
-    * No templates at all → ``{}``. An app without Packer declares no
-      ``image_name`` variable in its Terraform module, and passing
-      ``-var image_name=...`` for an undeclared variable is a hard
-      Terraform error. Deploy has always behaved this way; destroy and
-      redeploy used to inject a flat ``image_name`` here regardless,
-      which could only work by accident.
-    * Legacy single-template layout → flat ``{"default": "<app_id>-<tag>"}``.
-    * Multi-image apps → one ``<app_id>-<key>-<tag>`` entry per template.
+    ``packer_discovery`` is the only place that knows whether the app repo
+    used the flat ``packer/template.pkr.hcl`` layout or the multi-template
+    ``packer/<key>/`` one. Before this type, that single fact was re-derived
+    at eight call sites to answer eight different questions — image name,
+    Terraform variable name, phase names, Packer working directory, Packer
+    variable nesting and log prefix — and the copies had already drifted
+    apart. Now the layout is interpreted once, in :func:`_plan_images`, and
+    everything downstream reads a resolved answer off the plan.
 
-    Used by deploy to *name* the images and by destroy/redeploy to
-    *reproduce* the same names, so Terraform's variable validation matches
-    the pg-backend state. One function, so the two can't drift.
+    Deploy uses a plan to *build* an image; destroy and redeploy build the
+    same plans to *name* the images the original deploy produced, so the
+    Terraform variables still validate against the pg-backend state.
     """
-    if not templates:
-        return {}
-    if _is_legacy_layout(templates):
-        return {"default": f"{app_id}-{image_tag}"}
-    return {t.key: f"{app_id}-{t.key}-{image_tag}" for t in templates}
+
+    key: str
+    is_legacy: bool
+
+    @property
+    def log_prefix(self) -> str:
+        """Per-template log prefix; empty for the legacy single-image layout."""
+        return "" if self.is_legacy else f"[{self.key}] "
+
+    @property
+    def terraform_var_name(self) -> str:
+        """HCL variable the image name is passed in as."""
+        return "image_name" if self.is_legacy else f"image_name_{self.key}"
+
+    @property
+    def phase_names(self) -> tuple[str, str, str]:
+        """The (init, validate, build) phase names for this template."""
+        suffix = "" if self.is_legacy else f":{self.key}"
+        return (
+            f"{PHASE_PACKER_INIT}{suffix}",
+            f"{PHASE_PACKER_VALIDATE}{suffix}",
+            f"{PHASE_PACKER_BUILD}{suffix}",
+        )
+
+    def image_name(self, app_id: str, image_tag: str) -> str:
+        """Glance image name. Must match byte-for-byte across deploy/destroy/redeploy."""
+        return f"{app_id}-{image_tag}" if self.is_legacy else f"{app_id}-{self.key}-{image_tag}"
+
+    def packer_dir(self, repo_path: str) -> str:
+        """Working directory for ``packer init/validate/build``."""
+        if self.is_legacy:
+            return os.path.join(repo_path, "packer")
+        return os.path.join(repo_path, "packer", self.key)
+
+    def user_packer_vars(self, user_vars: dict[str, Any]) -> dict[str, Any]:
+        """This template's slice of the user-supplied Packer variables.
+
+        Legacy apps use a flat ``user_vars["packer"][var]``; multi-image
+        apps nest one level deeper under the template key.
+        """
+        packer = user_vars.get("packer") or {}
+        if self.is_legacy:
+            return dict(packer)
+        return dict(packer.get(self.key) or {})
 
 
-def _apply_image_name_vars(target: dict[str, Any], image_names: dict[str, str]) -> None:
-    """Inject the image-name variable(s) into a Terraform var-set.
+def _plan_images(templates: list[_PackerTemplate]) -> list[_ImagePlan]:
+    """Normalise the discovered templates into one plan per image.
 
-    The shape follows from the map ``_build_image_names`` produced, so no
-    caller has to re-derive "is this the legacy layout?":
-
-    * empty → nothing injected (app has no Packer, so no image variable
-      is declared),
-    * ``{"default": ...}`` → a single flat ``image_name``,
-    * anything else → one ``image_name_<key>`` per template.
+    The single place the legacy/multi distinction is interpreted. An app
+    with no Packer template yields no plans at all — and therefore no
+    ``image_name`` variable, which is correct: such an app declares none,
+    and ``terraform -var`` on an undeclared variable is a hard error.
     """
-    if not image_names:
-        return
-    if set(image_names) == {"default"}:
-        target["image_name"] = image_names["default"]
-        return
-    for key, name in image_names.items():
-        target[f"image_name_{key}"] = name
+    legacy = _is_legacy_layout(templates)
+    return [_ImagePlan(key=t.key, is_legacy=legacy) for t in templates]
+
+
+def _apply_image_name_vars(target: dict[str, Any], plans: list[_ImagePlan], app_id: str, image_tag: str) -> None:
+    """Inject each plan's image-name variable into a Terraform var-set."""
+    for plan in plans:
+        target[plan.terraform_var_name] = plan.image_name(app_id, image_tag)
 
 
 def _cleanup_task_resources(clouds_config: PerTaskCloudsConfig | None, repo_path: str | None, task_logger: Any) -> None:
@@ -557,10 +596,9 @@ def _cleanup_task_resources(clouds_config: PerTaskCloudsConfig | None, repo_path
 
 
 def _build_one_packer_image(
-    tmpl,
+    plan: _ImagePlan,
     *,
     image_name,
-    is_legacy,
     openstack_service,
     project_id,
     repo_path,
@@ -577,13 +615,9 @@ def _build_one_packer_image(
     worker builds a given image; the others wait and reuse it). Raises
     ``Exception("Packer error: ...")`` on any failure.
     """
-    log_prefix = "" if is_legacy else f"[{tmpl.key}] "
-
-    # Phase names: legacy stays unsuffixed; multi-template apps get one
-    # ``PHASE:<key>`` trio per template.
-    init_phase = PHASE_PACKER_INIT if is_legacy else f"{PHASE_PACKER_INIT}:{tmpl.key}"
-    validate_phase = PHASE_PACKER_VALIDATE if is_legacy else f"{PHASE_PACKER_VALIDATE}:{tmpl.key}"
-    build_phase = PHASE_PACKER_BUILD if is_legacy else f"{PHASE_PACKER_BUILD}:{tmpl.key}"
+    # Every legacy-vs-multi decision is already resolved on the plan.
+    log_prefix = plan.log_prefix
+    init_phase, validate_phase, build_phase = plan.phase_names
 
     wait_announced = False
     # PackerBuildLock is a context manager; ``__exit__`` releases the lock
@@ -636,9 +670,7 @@ def _build_one_packer_image(
                 # ``packer/`` directly; multi uses ``packer/<key>/``. Template
                 # file name is always ``template.pkr.hcl`` relative to that
                 # directory.
-                packer_dir = (
-                    os.path.join(repo_path, "packer") if is_legacy else os.path.join(repo_path, "packer", tmpl.key)
-                )
+                packer_dir = plan.packer_dir(repo_path)
                 packer = PackerExecutor(
                     packer_dir,
                     env_vars=openstack_env,
@@ -648,11 +680,7 @@ def _build_one_packer_image(
                 # Per-template Packer variables. Legacy shape is the flat
                 # ``user_vars["packer"][var_name]``; multi shape is nested
                 # ``user_vars["packer"][template_key][var_name]``.
-                if is_legacy:
-                    user_packer = user_vars.get("packer", {})
-                else:
-                    user_packer = (user_vars.get("packer") or {}).get(tmpl.key, {}) or {}
-                packer_vars = {**user_packer}
+                packer_vars = plan.user_packer_vars(user_vars)
                 packer_vars["image_name"] = image_name
                 packer_vars = encode_packer_vars(packer_vars)
 
@@ -660,7 +688,7 @@ def _build_one_packer_image(
                     f"{log_prefix}Packer variable keys",
                     category=LogCategory.OPERATION,
                     keys=list(packer_vars.keys()),
-                    template=tmpl.key,
+                    template=plan.key,
                     image_name=image_name,
                 )
 
@@ -842,7 +870,7 @@ def deploy_application(
             raise Exception(f"Packer template discovery failed: {e}")
 
         image_tag = _image_tag(commit_info, release)
-        image_names = _build_image_names(templates, app_id, image_tag)
+        image_plans = _plan_images(templates)
 
         # Decide once whether this deployment needs a Packer build, and
         # adapt the phase total accordingly so the percent bar is honest.
@@ -871,13 +899,10 @@ def deploy_application(
         else:
             project_id = openstack_envelope.get("project_id") or openstack_envelope.get("project_name") or "default"
             openstack_service = OpenStackService(env_vars=openstack_env)
-            is_legacy = _is_legacy_layout(templates)
-
-            for tmpl in templates:
+            for plan in image_plans:
                 _build_one_packer_image(
-                    tmpl,
-                    image_name=image_names[tmpl.key],
-                    is_legacy=is_legacy,
+                    plan,
+                    image_name=plan.image_name(app_id, image_tag),
                     openstack_service=openstack_service,
                     project_id=project_id,
                     repo_path=repo_path,
@@ -924,7 +949,7 @@ def deploy_application(
             # Per-template image-name injection. Legacy single-template
             # apps see a flat ``image_name``; multi-image apps declare one
             # ``image_name_<key>`` per template, filled here.
-            _apply_image_name_vars(terraform_vars, image_names)
+            _apply_image_name_vars(terraform_vars, image_plans, app_id, image_tag)
             if teams:
                 terraform_vars["users"] = teams
             terraform_vars = encode_terraform_vars(terraform_vars)
@@ -1004,7 +1029,7 @@ def deploy_application(
                     # declared var on every run, so an apply-only file-var
                     # would otherwise reject the cleanup with a schema error.
                     cleanup_tf_vars = _strip_file_vars(user_vars.get("terraform") or {})
-                    _apply_image_name_vars(cleanup_tf_vars, image_names)
+                    _apply_image_name_vars(cleanup_tf_vars, image_plans, app_id, image_tag)
                     if teams:
                         cleanup_tf_vars["users"] = teams
                     terraform.destroy(variables=encode_terraform_vars(cleanup_tf_vars))
@@ -1185,7 +1210,7 @@ def destroy_deployment(
             raise Exception(f"Packer template discovery failed: {e}")
 
         image_tag = _image_tag(commit_info, release)
-        image_names = _build_image_names(templates, app_id, image_tag)
+        image_plans = _plan_images(templates)
 
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
@@ -1201,7 +1226,7 @@ def destroy_deployment(
         # Inject the per-template image-name variables. Legacy single
         # template (or no Packer at all) keeps the flat ``image_name``;
         # multi-template apps get one ``image_name_<key>`` per template.
-        _apply_image_name_vars(terraform_vars, image_names)
+        _apply_image_name_vars(terraform_vars, image_plans, app_id, image_tag)
         if teams:
             terraform_vars["users"] = teams
         terraform_vars = encode_terraform_vars(terraform_vars)
@@ -1877,7 +1902,7 @@ def redeploy_resource(
             raise Exception(f"Packer template discovery failed: {e}")
 
         image_tag = _image_tag(commit_info, release)
-        image_names = _build_image_names(templates, app_id, image_tag)
+        image_plans = _plan_images(templates)
 
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
@@ -1897,7 +1922,7 @@ def redeploy_resource(
         terraform_vars = _reconcile_scoped_vars_to_roster(terraform_vars, teams, task_logger)
         # Inject the per-template image-name variables (legacy: flat
         # ``image_name``; multi: one ``image_name_<key>`` per template).
-        _apply_image_name_vars(terraform_vars, image_names)
+        _apply_image_name_vars(terraform_vars, image_plans, app_id, image_tag)
         if teams:
             terraform_vars["users"] = teams
         terraform_vars = encode_terraform_vars(terraform_vars)
