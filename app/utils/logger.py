@@ -338,11 +338,17 @@ class StructuredLogger:
         # kwarg literally named ``message`` (e.g. a git commit message via
         # ``resource_info(..., message=...)``) lands in ``**fields`` rather
         # than colliding with the parameter.
-        cleaned = clean_text(str(message))
-        truncated = False
-        if len(cleaned) > max_chars:
-            cleaned = truncate_text(cleaned, max_lines=50, max_chars=max_chars)
-            truncated = True
+        # Truncate BEFORE cleaning. ``clean_text`` runs a full ANSI regex
+        # pass over the whole string, and ``command_output`` hands us entire
+        # multi-MB terraform/packer transcripts only to keep 5000 chars of
+        # them — scanning the discarded 99.9% first is pure waste.
+        # ``truncate_text`` keeps a head and a tail, so the ANSI escapes in
+        # the surviving text are still stripped.
+        raw = str(message)
+        truncated = len(raw) > max_chars
+        if truncated:
+            raw = truncate_text(raw, max_lines=50, max_chars=max_chars)
+        cleaned = clean_text(raw)
         # Slot keys are recognised dataclass fields. Anything else lands
         # in ``extra``.
         slot_keys = {

@@ -100,6 +100,13 @@ def _make_build_lock_mock(mocker, *, held=True):
     inst = mocker.MagicMock()
     inst.acquire_or_wait.return_value = held
     inst.release.return_value = None
+    # tasks.py drives the lock via ``with PackerBuildLock(...) as lock``.
+    # The real ``__enter__`` returns ``self`` (build_lock.py), so the mock
+    # has to as well — a bare MagicMock would otherwise return a fresh
+    # child mock and every assertion on ``inst`` would silently pass by
+    # never being exercised.
+    inst.__enter__.return_value = inst
+    inst.__exit__.return_value = None
     cls = mocker.patch("app.tasks.PackerBuildLock", return_value=inst)
     return cls, inst
 
@@ -372,7 +379,8 @@ class TestDeployApplication:
         assert tf_inst.plan.called and tf_inst.apply.called
         assert not tf_inst.destroy.called
         lock_inst.acquire_or_wait.assert_called_once()
-        lock_inst.release.assert_called_once()
+        # Teardown now runs through the context-manager protocol.
+        lock_inst.__exit__.assert_called_once()
 
     def test_multi_template_iterates_each_discovered(self, mocker, tmp_path):
         """Multi-template repo runs Packer once per template (in order)."""
@@ -456,6 +464,8 @@ class TestDeployApplication:
 
         lock_inst = mocker.MagicMock()
         lock_inst.acquire_or_wait.return_value = False  # blocked → wait branch
+        lock_inst.__enter__.return_value = lock_inst
+        lock_inst.__exit__.return_value = None
         mocker.patch("app.tasks.PackerBuildLock", return_value=lock_inst)
 
         _, packer_inst = _make_packer_mock(mocker)
