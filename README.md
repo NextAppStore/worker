@@ -80,3 +80,19 @@ Die `Failure`-Exception in `tasks.py` trägt strukturierte Fehlerdaten durch Cel
 
 - Architektur und projektübergreifende Doku: [.github-Repo](https://github.com/six7-click-n-deploy/.github)
 - Backend-Service: [backend-Repo](https://github.com/six7-click-n-deploy/backend)
+
+## IPv4-/IPv6-Datenfluss testen
+
+`tests/test_ipv6_payloads.py` prüft IPv4/IPv6-Adressen, CIDRs und URLs an den
+Celery-, Packer- und Terraform-Schnittstellen. Der Integrationstest führt mit
+dem im Worker-Container installierten Terraform ein lokales Apply ohne
+Provider und ohne Cloud-Ressourcen aus. Außerhalb des Containers wird dieser
+Test bei fehlender Terraform-Binary übersprungen; das ersetzt keinen
+Funktionsnachweis. Für die Abnahme im Worker-Container ausführen:
+
+```bash
+poetry run pytest tests/test_ipv6_payloads.py -v
+```
+
+Die Netzwerk-Erreichbarkeit der Cloud und ein echter Packer-Image-Build sind
+separate Deployment-/App-Template-Tests.
