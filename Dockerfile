@@ -32,7 +32,7 @@ FROM python:3.11-slim AS runtime
 
 # Build arguments für Multi-Platform Support
 ARG TARGETARCH
-ARG TERRAFORM_VERSION=1.15.5
+ARG OPENTOFU_VERSION=1.13.1
 ARG PACKER_VERSION=1.15.3
 
 WORKDIR /app
@@ -62,14 +62,14 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 # OpenStack CLI installieren
 RUN pip install --no-cache-dir python-openstackclient
 
-# Terraform installieren (platform-aware)
+# OpenTofu installieren (platform-aware)
 RUN ARCH="${TARGETARCH:-amd64}" && \
-    echo "Installing Terraform ${TERRAFORM_VERSION} for ${ARCH}" && \
-    wget -q https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip && \
-    unzip -qo terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip && \
-    mv terraform /usr/local/bin/ && \
-    rm -f terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip LICENSE.txt && \
-    terraform --version
+    echo "Installing OpenTofu ${OPENTOFU_VERSION} for ${ARCH}" && \
+    wget -q https://github.com/opentofu/opentofu/releases/download/v${OPENTOFU_VERSION}/tofu_${OPENTOFU_VERSION}_linux_${ARCH}.zip && \
+    unzip -qo tofu_${OPENTOFU_VERSION}_linux_${ARCH}.zip && \
+    mv tofu /usr/local/bin/ && \
+    rm -f tofu_${OPENTOFU_VERSION}_linux_${ARCH}.zip LICENSE CHANGELOG.md README.md && \
+    tofu --version
 
 # Packer installieren (platform-aware)
 RUN ARCH="${TARGETARCH:-amd64}" && \

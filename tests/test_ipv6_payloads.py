@@ -7,8 +7,8 @@ from unittest.mock import MagicMock
 import pytest
 from kombu.serialization import dumps, loads
 
+from app.services.opentofu_executor import OpenTofuExecutor
 from app.services.packer_executor import PackerExecutor
-from app.services.terraform_executor import TerraformExecutor
 from app.tasks import Failure, encode_packer_vars, encode_terraform_vars
 
 
@@ -26,7 +26,7 @@ def test_task_variables_reach_tool_arguments(mocker, tmp_path, network_values):
     """Capture actual executor argv after Celery serialization and task encoding."""
     content_type, encoding, body = dumps(network_values, serializer="json")
     received = loads(body, content_type, encoding)
-    tf = TerraformExecutor(str(tmp_path))
+    tf = OpenTofuExecutor(str(tmp_path))
     stream = mocker.patch.object(tf, "_run_streamed", return_value=(True, "", ""))
     assert tf.plan(variables=encode_terraform_vars(received))[0]
     tf_args = stream.call_args.args[0]
@@ -43,14 +43,14 @@ def test_task_variables_reach_tool_arguments(mocker, tmp_path, network_values):
 def test_terraform_outputs_survive_success_and_failure_messages(mocker, tmp_path, network_values):
     outputs = {"team_vms": {"value": {"Team-1": network_values}}}
     mocker.patch(
-        "app.services.terraform_executor.subprocess.run",
+        "app.services.opentofu_executor.subprocess.run",
         return_value=MagicMock(
             returncode=0,
             stdout=json.dumps(outputs),
             stderr="",
         ),
     )
-    result = TerraformExecutor(str(tmp_path)).output()
+    result = OpenTofuExecutor(str(tmp_path)).output()
     content_type, encoding, body = dumps({"terraform_outputs": result}, serializer="json")
     assert loads(body, content_type, encoding)["terraform_outputs"] == outputs
     failure = Failure("test", "dep", [], terraform_outputs=result)
@@ -58,11 +58,11 @@ def test_terraform_outputs_survive_success_and_failure_messages(mocker, tmp_path
 
 
 @pytest.mark.integration
-def test_real_terraform_preserves_dual_stack_values(tmp_path):
+def test_real_opentofu_preserves_dual_stack_values(tmp_path):
     """Use the installed CLI with local state and no providers/cloud resources."""
-    executor = TerraformExecutor(str(tmp_path))
-    if shutil.which(executor.terraform_path) is None:
-        pytest.skip("Requires the worker container's Terraform CLI")
+    executor = OpenTofuExecutor(str(tmp_path))
+    if shutil.which(executor.tofu_path) is None:
+        pytest.skip("Requires the worker container's OpenTofu CLI")
     (tmp_path / "main.tf").write_text(
         """
 variable "ips" { type = list(string) }

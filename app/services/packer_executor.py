@@ -14,7 +14,7 @@ from typing import Any
 
 from ..config import settings
 from ..utils.logger import LogCategory, get_logger
-from .terraform_executor import OutputCallback, _stream_subprocess
+from .opentofu_executor import OutputCallback, _stream_subprocess
 
 logger = get_logger(__name__)
 

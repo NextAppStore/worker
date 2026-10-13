@@ -88,7 +88,7 @@ def truncate_text(text: str, max_lines: int = 50, max_chars: int = 5000) -> str:
     """Truncate text intelligently for the buffered transcript.
 
     For tool output the *tail* almost always matters more than the
-    head — Terraform/Packer print the error block last, and naively
+    head — OpenTofu/Packer print the error block last, and naively
     cutting off the end (``text[:max_chars]``) systematically hides
     the very thing we wanted to log. So the strategy is:
 

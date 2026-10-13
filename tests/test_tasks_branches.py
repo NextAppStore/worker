@@ -1,6 +1,6 @@
 """Branch-coverage tests for worker/app/tasks.py.
 
-These tests mock every external boundary (TerraformExecutor, PackerExecutor,
+These tests mock every external boundary (OpenTofuExecutor, PackerExecutor,
 PerTaskCloudsConfig, git_service, OpenStackService, PackerBuildLock,
 packer-template discovery) so each test exercises one decision branch of the
 real task code without touching disk, processes, or the network.
@@ -60,8 +60,8 @@ def _make_clouds_config_mock(mocker):
     return cls, cc
 
 
-def _make_terraform_executor_mock(mocker, *, init=True, plan=True, apply_=True, destroy=True, state="{}", output=None):
-    """Patch ``TerraformExecutor`` so every method returns the supplied stub.
+def _make_tofu_executor_mock(mocker, *, init=True, plan=True, apply_=True, destroy=True, state="{}", output=None):
+    """Patch ``OpenTofuExecutor`` so every method returns the supplied stub.
 
     The same instance is returned for every constructor call so the test can
     inspect call args across the whole task body.
@@ -73,7 +73,7 @@ def _make_terraform_executor_mock(mocker, *, init=True, plan=True, apply_=True, 
     inst.destroy.return_value = (destroy, "destroy-stdout", "destroy-stderr")
     inst.state_pull.return_value = state
     inst.output.return_value = output if output is not None else {"ip": "1.2.3.4"}
-    cls = mocker.patch("app.tasks.TerraformExecutor", return_value=inst)
+    cls = mocker.patch("app.tasks.OpenTofuExecutor", return_value=inst)
     return cls, inst
 
 
@@ -352,7 +352,7 @@ class TestDeployApplication:
         _make_openstack_service_mock(mocker, image_exists=False)
         _, lock_inst = _make_build_lock_mock(mocker, held=True)
         _, packer_inst = _make_packer_mock(mocker)
-        _, tf_inst = _make_terraform_executor_mock(mocker)
+        _, tf_inst = _make_tofu_executor_mock(mocker)
 
         result = deploy_application.run(
             deployment_id="dep-1",
@@ -388,7 +388,7 @@ class TestDeployApplication:
         _make_openstack_service_mock(mocker, image_exists=False)
         _make_build_lock_mock(mocker, held=True)
         _, packer_inst = _make_packer_mock(mocker)
-        _, tf_inst = _make_terraform_executor_mock(mocker)
+        _, tf_inst = _make_tofu_executor_mock(mocker)
 
         result = deploy_application.run(
             deployment_id="dep-1",
@@ -420,7 +420,7 @@ class TestDeployApplication:
         _make_openstack_service_mock(mocker, image_exists=True)
         _, lock_inst = _make_build_lock_mock(mocker)
         _, packer_inst = _make_packer_mock(mocker)
-        _, tf_inst = _make_terraform_executor_mock(mocker)
+        _, tf_inst = _make_tofu_executor_mock(mocker)
 
         result = deploy_application.run(
             deployment_id="dep-1",
@@ -459,7 +459,7 @@ class TestDeployApplication:
         mocker.patch("app.tasks.PackerBuildLock", return_value=lock_inst)
 
         _, packer_inst = _make_packer_mock(mocker)
-        _, tf_inst = _make_terraform_executor_mock(mocker)
+        _, tf_inst = _make_tofu_executor_mock(mocker)
 
         result = deploy_application.run(
             deployment_id="dep-1",
@@ -489,7 +489,7 @@ class TestDeployApplication:
         _make_openstack_service_mock(mocker, image_exists=False)
         _make_build_lock_mock(mocker, held=True)
         _make_packer_mock(mocker, build=False)
-        _, tf_inst = _make_terraform_executor_mock(mocker)
+        _, tf_inst = _make_tofu_executor_mock(mocker)
 
         with pytest.raises(Failure):
             deploy_application.run(
@@ -520,7 +520,7 @@ class TestDeployApplication:
         _make_openstack_service_mock(mocker)
         _make_build_lock_mock(mocker)
         _make_packer_mock(mocker)
-        _, tf_inst = _make_terraform_executor_mock(mocker, apply_=False)
+        _, tf_inst = _make_tofu_executor_mock(mocker, apply_=False)
 
         with pytest.raises(Failure) as exc:
             deploy_application.run(
@@ -533,7 +533,7 @@ class TestDeployApplication:
                 openstack_envelope={"project_id": "p1"},
             )
 
-        assert "Terraform apply failed" in str(exc.value)
+        assert "OpenTofu apply failed" in str(exc.value)
         assert tf_inst.destroy.called  # cleanup-after-failure
         assert tf_inst.apply.called
 
@@ -567,7 +567,7 @@ class TestDeployApplication:
         _make_openstack_service_mock(mocker)
         _make_build_lock_mock(mocker)
         _make_packer_mock(mocker)
-        _make_terraform_executor_mock(mocker)
+        _make_tofu_executor_mock(mocker)
 
         secret = "SUPER-SECRET-PASSWORD-9999"
         result = deploy_application.run(
@@ -599,7 +599,7 @@ class TestDeployApplication:
         _make_openstack_service_mock(mocker)
         _make_build_lock_mock(mocker)
         _make_packer_mock(mocker)
-        _, tf_inst = _make_terraform_executor_mock(mocker)
+        _, tf_inst = _make_tofu_executor_mock(mocker)
 
         deploy_application.run(
             deployment_id="dep-1",
@@ -633,7 +633,7 @@ class TestDestroyDeployment:
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
         mocker.patch("app.tasks._discover_packer_templates", return_value=[])
-        _, tf_inst = _make_terraform_executor_mock(mocker)
+        _, tf_inst = _make_tofu_executor_mock(mocker)
 
         result = destroy_deployment.run(
             deployment_id="dep-1",
@@ -659,7 +659,7 @@ class TestDestroyDeployment:
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
         mocker.patch("app.tasks._discover_packer_templates", return_value=[])
-        _make_terraform_executor_mock(mocker, destroy=False)
+        _make_tofu_executor_mock(mocker, destroy=False)
 
         with pytest.raises(Failure) as exc:
             destroy_deployment.run(
@@ -671,7 +671,7 @@ class TestDestroyDeployment:
                 teams=None,
                 openstack_envelope={"project_id": "p1"},
             )
-        assert "Terraform destroy failed" in str(exc.value)
+        assert "OpenTofu destroy failed" in str(exc.value)
 
 
 # --- pause / resume ---------------------------------------------------------
@@ -702,7 +702,7 @@ class TestPauseResume:
                 ]
             }
         )
-        _make_terraform_executor_mock(mocker, state=state)
+        _make_tofu_executor_mock(mocker, state=state)
         _, os_inst = _make_openstack_service_mock(mocker)
 
         result = task.run(
@@ -735,7 +735,7 @@ class TestPauseResume:
         _silence_events(mocker, pause_deployment)
         _make_git_mock(mocker, repo_path)
         _make_clouds_config_mock(mocker)
-        _make_terraform_executor_mock(mocker, state='{"resources": []}')
+        _make_tofu_executor_mock(mocker, state='{"resources": []}')
         _, os_inst = _make_openstack_service_mock(mocker)
 
         with pytest.raises(Failure) as exc:
@@ -773,7 +773,7 @@ class TestPauseResume:
                 ]
             }
         )
-        _make_terraform_executor_mock(mocker, state=state)
+        _make_tofu_executor_mock(mocker, state=state)
         os_inst = mocker.MagicMock()
         os_inst.server_show.return_value = {"name": "n", "status": "ACTIVE"}
         os_inst.server_stop.side_effect = [(True, None), (False, "locked")]
@@ -812,7 +812,7 @@ class TestRedeployResource:
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
         mocker.patch("app.tasks._discover_packer_templates", return_value=[])
-        _, tf_inst = _make_terraform_executor_mock(mocker)
+        _, tf_inst = _make_tofu_executor_mock(mocker)
 
         addr = 'openstack_compute_instance_v2.team_ide["Team-A"]'
         result = redeploy_resource.run(

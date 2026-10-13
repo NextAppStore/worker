@@ -83,8 +83,10 @@ clouds.yaml
 secure.yaml
 
 # -----------------------------------------------------------------------------
-# Terraform / Packer (lokale Testdateien)
+# OpenTofu / Packer (lokale Testdateien)
 # -----------------------------------------------------------------------------
+# OpenTofu kept Terraform's file/directory naming (.terraform/,
+# .terraform.lock.hcl, *.tfstate, *.tfvars) for drop-in compatibility.
 *.tfstate
 *.tfstate.*
 .terraform/

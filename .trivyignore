@@ -5,7 +5,7 @@
 # revisit when the upstream advisory changes.
 
 # AVD-DS-0002: Dockerfile/Dockerfile.dev run as root.
-# The worker invokes terraform / packer / openstack CLI against
+# The worker invokes OpenTofu / packer / openstack CLI against
 # bind-mounted git repos. Switching to non-root requires verifying
 # that all three toolchains can write into /tmp/worker_repos and
 # .terraform plugin caches without permission issues — and that
@@ -39,22 +39,27 @@ CVE-2026-53488
 CVE-2026-53489
 CVE-2026-53492
 
-# Terraform upstream CVE backlog — Terraform's latest stable release
-# (v1.15.5) is built against Go 1.25.9; HashiCorp hasn't yet shipped
-# a rebuild against Go 1.25.11+. Nothing to fix on our side; we bump
-# TERRAFORM_VERSION as soon as HashiCorp ships a release built against
-# Go 1.25.11 / 1.26.4 or later.
+# TODO(#3): the entries below were suppressed against the Terraform
+# binary's Go build version and need re-auditing against OpenTofu's own
+# release/Go cadence (OpenTofu v1.13.1 has its own Go toolchain, not
+# necessarily the same as Terraform v1.15.5). Re-run Trivy against the
+# built OpenTofu image and remove/replace entries that no longer apply
+# rather than carrying them over unchecked.
+#
+# Previous (Terraform) upstream CVE backlog — Terraform's latest stable
+# release (v1.15.5) was built against Go 1.25.9; HashiCorp hadn't yet
+# shipped a rebuild against Go 1.25.11+.
 #
 # Go stdlib (fixed in 1.25.11 / 1.26.4):
 CVE-2026-42504
 # Go stdlib os.Root symlink-following / directory-traversal (fixed in
-# 1.25.12 / 1.26.5 / 1.27.0-rc.2). Hits both Packer and Terraform
-# binaries; suppressed until HashiCorp rebuilds against Go 1.25.12+.
+# 1.25.12 / 1.26.5 / 1.27.0-rc.2). Hits both Packer and (previously)
+# Terraform binaries; needs re-checking against OpenTofu's Go version.
 CVE-2026-39822
 
-# Go modules vendored into Packer and/or Terraform — fixed upstream but
-# only available after HashiCorp ships a rebuild. Same backlog story
-# as the stdlib entries above.
+# Go modules vendored into Packer and/or (previously) Terraform — fixed
+# upstream but only available after a rebuild. Same backlog story as
+# the stdlib entries above; re-audit against OpenTofu.
 #
 # golang.org/x/crypto (fixed in 0.52.0):
 CVE-2026-39827
@@ -79,6 +84,6 @@ CVE-2026-42502
 CVE-2026-42506
 
 # google.golang.org/grpc (fixed in 1.82.1): gRPC-Go xDS RBAC / HTTP/2
-# advisory. Vendored into Packer and Terraform; available once HashiCorp
-# rebuilds against the patched grpc. Nothing to fix on our side.
+# advisory. Vendored into Packer and (previously) Terraform; needs
+# re-checking against OpenTofu's vendored grpc version.
 GHSA-hrxh-6v49-42gf

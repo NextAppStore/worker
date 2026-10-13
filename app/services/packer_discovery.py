@@ -31,8 +31,8 @@ Hard errors (``PackerTemplateDiscoveryError``):
   The two layouts are mutually exclusive; mixing them would silently
   bias which template a deploy sees, so we refuse to guess.
 * A subdirectory's name does not match ``[a-z][a-z0-9_-]{0,30}``. The
-  key becomes part of an image name (``<app_id>-<key>-<tag>``) and a
-  terraform variable suffix (``image_name_<key>``), both of which have
+  key becomes part of an image name (``<app_id>-<key>-<tag>``) and an
+  OpenTofu variable suffix (``image_name_<key>``), both of which have
   stricter syntax than a generic directory name — surfacing the
   problem as a hard error is friendlier than silently ignoring a
   typo'd subdirectory.
