@@ -19,12 +19,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install OpenStack CLI
 RUN pip install --no-cache-dir python-openstackclient
 
-# Install Terraform
-ARG TERRAFORM_VERSION=1.6.6
-RUN wget https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip \
-    && unzip terraform_${TERRAFORM_VERSION}_linux_amd64.zip \
-    && mv terraform /usr/local/bin/ \
-    && rm terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+# Install OpenTofu
+ARG OPENTOFU_VERSION=1.13.1
+RUN wget https://github.com/opentofu/opentofu/releases/download/v${OPENTOFU_VERSION}/tofu_${OPENTOFU_VERSION}_linux_amd64.zip \
+    && unzip tofu_${OPENTOFU_VERSION}_linux_amd64.zip \
+    && mv tofu /usr/local/bin/ \
+    && rm tofu_${OPENTOFU_VERSION}_linux_amd64.zip
 
 # Install Packer
 ARG PACKER_VERSION=1.10.0

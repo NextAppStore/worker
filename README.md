@@ -2,7 +2,7 @@
 
 [![Coverage](https://img.shields.io/endpoint?url=https://six7-click-n-deploy.github.io/worker/badge.json)](https://six7-click-n-deploy.github.io/worker/)
 
-Celery-Worker des App Stores. Konsumiert Deployment-Tasks aus RabbitMQ, klont das App-Repository, führt Packer + Terraform aus und provisioniert auf OpenStack.
+Celery-Worker des App Stores. Konsumiert Deployment-Tasks aus RabbitMQ, klont das App-Repository, führt Packer + OpenTofu aus und provisioniert auf OpenStack.
 
 ## Setup
 
@@ -25,15 +25,15 @@ Tests, Lint und Format laufen im Worker-Container — `make shell-worker` öffne
 
 ## Was der Worker tut
 
-- **Deploy**: klont das App-Repo am Release-Tag, baut bei Bedarf ein Packer-Image, führt `terraform apply` aus
-- **Destroy**: `terraform destroy` gegen denselben Tag/dieselben Variablen
+- **Deploy**: klont das App-Repo am Release-Tag, baut bei Bedarf ein Packer-Image, führt `tofu apply` aus
+- **Destroy**: `tofu destroy` gegen denselben Tag/dieselben Variablen
 - **Update**: deployt neue Version im Bestands-State
 - **OpenStack-Auth**: per-Task `clouds.yaml`, generiert aus dem vom Backend verschlüsselten Credentials-Envelope
 
 ## Technologie-Stack
 
 - **Celery 5** mit RabbitMQ als Broker, Redis als Result-Backend
-- **Terraform 1.x** mit Postgres-Remote-State
+- **OpenTofu 1.x** mit Postgres-Remote-State
 - **Packer 1.x** für Image-Builds
 - **GitPython** für Repo-Klone
 - **SQLAlchemy 2.0** nur lesend gegen die App-DB
@@ -41,7 +41,7 @@ Tests, Lint und Format laufen im Worker-Container — `make shell-worker` öffne
 
 ## Code-Struktur
 
-Der Code liegt in `app/`. Einstieg ist `tasks.py`: Celery ruft eine Task-Funktion auf, die die Services orchestriert — Repo klonen → (optional) Packer → Terraform → OpenStack. Jeder Service kapselt genau einen dieser Schritte.
+Der Code liegt in `app/`. Einstieg ist `tasks.py`: Celery ruft eine Task-Funktion auf, die die Services orchestriert — Repo klonen → (optional) Packer → OpenTofu → OpenStack. Jeder Service kapselt genau einen dieser Schritte.
 
 ```
 app/
@@ -56,8 +56,8 @@ app/
 
 | Task | Zweck |
 |---|---|
-| `tasks.deploy_application` | Repo klonen → ggf. Packer-Image → `terraform apply` |
-| `tasks.destroy_deployment` | `terraform destroy` gegen denselben State |
+| `tasks.deploy_application` | Repo klonen → ggf. Packer-Image → `tofu apply` |
+| `tasks.destroy_deployment` | `tofu destroy` gegen denselben State |
 | `tasks.pause_deployment` | VMs stoppen (Daten bleiben) |
 | `tasks.resume_deployment` | Pausierte VMs wieder starten |
 | `tasks.redeploy_resource` | Einzelne Ressource im Bestands-State neu ausrollen |
@@ -71,7 +71,7 @@ Die `Failure`-Exception in `tasks.py` trägt strukturierte Fehlerdaten durch Cel
 | `git_service` | Klont das App-Repo am Release-Tag (HTTPS + Token) |
 | `packer_discovery` | Findet Packer-Templates im geklonten Repo |
 | `packer_executor` | Führt Packer-Builds aus (strukturiertes Logging) |
-| `terraform_executor` | Führt `terraform init/plan/apply/destroy` aus (Postgres-Remote-State) |
+| `opentofu_executor` | Führt `tofu init/plan/apply/destroy` aus (Postgres-Remote-State) |
 | `openstack_auth` | Materialisiert per-Task `clouds.yaml` aus dem verschlüsselten Credentials-Envelope |
 | `openstack_service` | OpenStack-Operationen, v.a. Image-Management |
 | `build_lock` | Redis-Lock um den Packer-Build, damit parallele Tasks nicht dasselbe Image doppelt bauen |
@@ -84,10 +84,10 @@ Die `Failure`-Exception in `tasks.py` trägt strukturierte Fehlerdaten durch Cel
 ## IPv4-/IPv6-Datenfluss testen
 
 `tests/test_ipv6_payloads.py` prüft IPv4/IPv6-Adressen, CIDRs und URLs an den
-Celery-, Packer- und Terraform-Schnittstellen. Der Integrationstest führt mit
-dem im Worker-Container installierten Terraform ein lokales Apply ohne
+Celery-, Packer- und OpenTofu-Schnittstellen. Der Integrationstest führt mit
+dem im Worker-Container installierten OpenTofu ein lokales Apply ohne
 Provider und ohne Cloud-Ressourcen aus. Außerhalb des Containers wird dieser
-Test bei fehlender Terraform-Binary übersprungen; das ersetzt keinen
+Test bei fehlender OpenTofu-Binary übersprungen; das ersetzt keinen
 Funktionsnachweis. Für die Abnahme im Worker-Container ausführen:
 
 ```bash

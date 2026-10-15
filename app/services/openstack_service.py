@@ -15,7 +15,7 @@ class OpenStackService:
 
     All methods shell out to the ``openstack`` CLI (python-openstackclient)
     rather than using the SDK in-process, mirroring how the rest of the
-    worker invokes external tooling (Packer, Terraform). Exit-code zero
+    worker invokes external tooling (Packer, OpenTofu). Exit-code zero
     is treated as success; stderr is captured and returned to the
     caller for surfacing in the per-deployment log.
 

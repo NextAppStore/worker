@@ -7,7 +7,7 @@ both observe "not found" and both kick off a build, leaving a duplicate image
 behind and burning ~10 minutes of compute. This lock serializes the build for
 a given image name within a given OpenStack project so only one worker
 actually builds; the other re-checks Glance after waiting and skips straight
-to Terraform if the image now exists.
+to OpenTofu if the image now exists.
 
 Backend: Redis (already present as Celery's result backend, no new dep).
 

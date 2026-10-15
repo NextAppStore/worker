@@ -7,7 +7,7 @@ package-mode = false
 authors = [
     "Your Name <your.email@example.com>"
 ]
-keywords = ["celery", "redis", "terraform", "packer", "git", "worker"]
+keywords = ["celery", "redis", "opentofu", "packer", "git", "worker"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

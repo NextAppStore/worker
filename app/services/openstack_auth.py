@@ -33,11 +33,11 @@ class PerTaskCloudsConfig:
     Usage:
         with PerTaskCloudsConfig(envelope, work_dir=repo_path) as env:
             packer.run(env_vars=env)
-            terraform.run(env_vars=env)
+            tofu.run(env_vars=env)
     """
 
     # Profile name written into the per-task ``clouds.yaml``. App
-    # Terraform templates reference this via ``provider "openstack" {
+    # OpenTofu templates reference this via ``provider "openstack" {
     # cloud = "openstack" }`` (matching the OpenStack convention used
     # in their docs), so changing this requires updating every
     # template — keep it as ``"openstack"`` unless there's a strong
