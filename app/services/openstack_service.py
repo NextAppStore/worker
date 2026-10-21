@@ -4,8 +4,9 @@ OpenStack service for image management
 
 import json
 import logging
-import os
 import subprocess
+
+from .. import job_context
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,9 @@ class OpenStackService:
     The CLI is configured via env vars (OS_AUTH_URL etc.) supplied by
     :class:`PerTaskCloudsConfig`. ``OS_CLIENT_CONFIG_FILE`` and
     ``OS_CLOUD`` make the CLI prefer the per-task ``clouds.yaml`` over
-    any ambient configuration on the worker host.
+    any ambient configuration on the worker host. Like OpenTofu and
+    Packer it runs in the job's context: minimal environment, the slot's
+    user, the job's remaining time.
     """
 
     def __init__(self, env_vars: dict[str, str] | None = None):
@@ -42,17 +45,19 @@ class OpenStackService:
         ``(returncode, stdout, stderr)`` so callers can decide how to
         report; structured-output methods JSON-decode stdout themselves.
         """
-        env = os.environ.copy()
-        env.update(self.env_vars)
+        ctx = job_context.current()
         try:
             result = subprocess.run(
                 args,
                 capture_output=True,
                 text=True,
-                timeout=timeout,
-                env=env,
+                timeout=ctx.timeout(timeout),
+                env=ctx.env(self.env_vars),
+                **ctx.popen_kwargs(),
             )
             return (result.returncode, result.stdout or "", result.stderr or "")
+        except job_context.JobTimeout as e:
+            return (-1, "", str(e))
         except subprocess.TimeoutExpired:
             return (-1, "", f"Timeout after {timeout}s running: {' '.join(args)}")
         except FileNotFoundError:

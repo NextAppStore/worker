@@ -1,7 +1,7 @@
 """Per-task OpenStack credential materialization.
 
-The worker receives an encrypted credential envelope on the Celery task args
-(see backend `crud.openstack_credentials.get_dispatch_envelope`). This module
+The worker receives an encrypted credential envelope inside the sealed job
+payload (see backend `crud.openstack_credentials.get_dispatch_envelope`). This module
 decrypts the envelope in-process and writes a `clouds.yaml` (mode 0600) into
 the per-deployment workspace for the duration of one task. The file is
 removed eagerly when the context manager exits — so, even on a crash, the
@@ -20,6 +20,7 @@ from typing import Any
 
 import yaml
 
+from .. import job_context
 from ..utils.crypto import decrypt
 
 
@@ -169,6 +170,9 @@ class PerTaskCloudsConfig:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(self.path)
             raise
+        # Readable by the job slot's user (its tools load it), still 0600:
+        # no other slot can read it.
+        job_context.current().hand_over(self.path)
 
         env = {
             "OS_CLIENT_CONFIG_FILE": self.path,
