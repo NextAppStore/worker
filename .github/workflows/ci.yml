@@ -26,7 +26,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
           cache: 'pip'
 
       - name: Install Poetry
@@ -40,11 +40,10 @@ jobs:
       - name: Run Ruff
         run: poetry run ruff check .
 
-      - name: Check Black formatting
-        run: poetry run black --check .
-
-      - name: Check isort formatting
-        run: poetry run isort --check-only .
+      # Ruff also formats (and sorts imports, rule I), like in the backend;
+      # black and isort are gone.
+      - name: Check formatting
+        run: poetry run ruff format --check .
 
       - name: Run MyPy
         run: poetry run mypy app/ --ignore-missing-imports
@@ -64,7 +63,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
           cache: 'pip'
 
       - name: Install Poetry
@@ -108,6 +107,23 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test-unit]
 
+    # The queue, the event sink and the Packer lock run against Postgres;
+    # the tests create (and drop) their own database on this server.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -115,7 +131,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
           cache: 'pip'
 
       - name: Install Poetry
@@ -130,8 +146,7 @@ jobs:
         run: poetry run pytest -m integration -v || [ $? -eq 5 ]
         env:
           CREDENTIAL_ENCRYPTION_KEY: "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U="
-          CELERY_BROKER_URL: "amqp://guest:guest@localhost:5672/"
-          CELERY_RESULT_BACKEND: "redis://localhost:6379/0"
+          TEST_DATABASE_URL: "postgresql://test:test@localhost:5432/test"
           # Suffix the .coverage file so it can be merged in the
           # `coverage` job alongside the unit job's data.
           COVERAGE_FILE: .coverage.integration
@@ -175,7 +190,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
           cache: 'pip'
 
       - name: Install Poetry
@@ -249,7 +264,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
           cache: 'pip'
 
       - name: Install Poetry

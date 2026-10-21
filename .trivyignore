@@ -5,11 +5,12 @@
 # revisit when the upstream advisory changes.
 
 # AVD-DS-0002: Dockerfile/Dockerfile.dev run as root.
-# The worker invokes OpenTofu / packer / openstack CLI against
-# bind-mounted git repos. Switching to non-root requires verifying
-# that all three toolchains can write into /tmp/worker_repos and
-# .terraform plugin caches without permission issues — and that
-# bind-mount UIDs line up on macOS + Linux. Tracked in #16.
+# On purpose: the worker process runs as root only to start each job's
+# tools (OpenTofu, Packer, openstack CLI) as their own unprivileged user
+# (UID 20000 + slot, WORKER_JOB_UID_BASE, see app/job_context.py). That
+# separation keeps an app's untrusted local-exec code away from the
+# worker's DATABASE_URL and Fernet key and from the job in the next slot.
+# The container needs the default SETUID/SETGID/CHOWN capabilities only.
 AVD-DS-0002
 
 # Packer upstream CVE backlog — Packer's latest release (v1.15.3)

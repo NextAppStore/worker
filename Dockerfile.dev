@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 ENV POETRY_VIRTUALENVS_IN_PROJECT=true \
     POETRY_VIRTUALENVS_CREATE=true
@@ -47,5 +47,9 @@ COPY . .
 # Create temp directory for repositories
 RUN mkdir -p /tmp/worker_repos
 
-# Starte Celery Worker mit poetry run
-CMD ["poetry", "run", "celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--autoscale=2,20", "-E", "--prefetch-multiplier=1"]
+# Job-Slots laufen wie in Prod unter eigener UID (siehe app/job_context.py).
+RUN mkdir -p /var/lib/appstore-worker && chmod 0711 /tmp/worker_repos /var/lib/appstore-worker
+ENV WORKER_JOB_UID_BASE=20000
+
+# Worker starten: LISTEN task_queued, Jobs aus der Postgres-Queue
+CMD ["poetry", "run", "python", "-m", "app"]
