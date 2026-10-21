@@ -5,10 +5,9 @@ PerTaskCloudsConfig, git_service, OpenStackService, PackerBuildLock,
 packer-template discovery) so each test exercises one decision branch of the
 real task code without touching disk, processes, or the network.
 
-Celery tasks declared with ``bind=True`` are invoked here via ``task.run(...)``
-— that's a method bound to the Task instance, so ``self`` inside the task
-body is the real Celery task object. We patch ``task.send_event`` on a
-per-test basis so the event bus is silenced.
+The jobs are plain functions whose first argument receives their live
+events (``send_event``); the runner passes a ``TaskEventSink``. Here a
+recording stand-in (``_Events``) takes its place, so no database is touched.
 """
 
 import json
@@ -26,7 +25,6 @@ from app.tasks import (
     _reconcile_scoped_vars_to_roster,
     _scrub_nested_nones,
     _strip_file_vars,
-    _tfstate_schema_name,
     deploy_application,
     destroy_deployment,
     encode_packer_vars,
@@ -46,9 +44,14 @@ class _FakeTemplate:
         self.key = key
 
 
-def _silence_events(mocker, task):
-    """Patch ``task.send_event`` so the broker/event bus is not touched."""
-    mocker.patch.object(task, "send_event", return_value=None)
+class _Events:
+    """Records the events a job sends (stand-in for ``job_queue.TaskEventSink``)."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, dict]] = []
+
+    def send_event(self, event_type: str, **payload) -> None:
+        self.sent.append((event_type, payload))
 
 
 def _make_clouds_config_mock(mocker):
@@ -98,7 +101,7 @@ def _make_openstack_service_mock(mocker, *, image_exists=False):
 
 def _make_build_lock_mock(mocker, *, held=True):
     inst = mocker.MagicMock()
-    inst.acquire_or_wait.return_value = held
+    inst.try_acquire.return_value = held
     inst.release.return_value = None
     cls = mocker.patch("app.tasks.PackerBuildLock", return_value=inst)
     return cls, inst
@@ -229,17 +232,6 @@ class TestScrubNestedNones:
 
 
 @pytest.mark.unit
-class TestSchemaName:
-    """Schema names are unquoted identifiers — hyphens become underscores."""
-
-    def test_replaces_hyphens(self):
-        """UUIDs with hyphens are converted into a single ``deployment_<safe>``."""
-        out = _tfstate_schema_name("11111111-2222-3333-4444-555555555555")
-        assert "-" not in out
-        assert out.startswith("deployment_")
-
-
-@pytest.mark.unit
 class TestPhasesForTemplates:
     """Phase tuple is rebuilt depending on how many templates were discovered."""
 
@@ -277,25 +269,22 @@ class TestPhaseTrackerUnknownPhase:
 
 
 @pytest.mark.unit
-class TestFailureRoundTrip:
-    """Failure exception serialises everything into args[0] for celery."""
+class TestFailure:
+    """Failure carries what the job produced as plain attributes."""
 
-    def test_to_dict_contains_payload(self):
-        """to_dict round-trips through the JSON in ``args[0]``."""
-        f = Failure("err", "dep-1", logs_dict=[{"k": "v"}], tf_state="state")
+    def test_attributes_and_to_dict(self):
+        """No JSON-in-the-message encoding any more: str() is the error."""
+        f = Failure("err", "dep-1", logs_dict=[{"k": "v"}], commit_info={"hash": "abc"}, terraform_outputs={"ip": 1})
+        assert str(f) == "err"
+        assert f.message == "err" and f.logs_dict == [{"k": "v"}]
         d = f.to_dict()
-        assert d["error"] == "err"
-        assert d["deployment_id"] == "dep-1"
-        assert d["tf_state"] == "state"
-
-    def test_pickle_round_trip_via_reduce(self):
-        """``__reduce__`` allows pickling without re-encoding the payload."""
-        import pickle
-
-        f = Failure("err", "dep-1", logs_dict=[], tf_state=None)
-        restored = pickle.loads(pickle.dumps(f))
-        assert isinstance(restored, Failure)
-        assert restored.deployment_id == "dep-1"
+        assert d == {
+            "error": "err",
+            "deployment_id": "dep-1",
+            "logs": [{"k": "v"}],
+            "commit_info": {"hash": "abc"},
+            "terraform_outputs": {"ip": 1},
+        }
 
 
 @pytest.mark.unit
@@ -344,7 +333,6 @@ class TestDeployApplication:
         os.makedirs(repo_path)
         _seed_terraform_dir(repo_path)
 
-        _silence_events(mocker, deploy_application)
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
@@ -354,7 +342,8 @@ class TestDeployApplication:
         _, packer_inst = _make_packer_mock(mocker)
         _, tf_inst = _make_tofu_executor_mock(mocker)
 
-        result = deploy_application.run(
+        result = deploy_application(
+            _Events(),
             deployment_id="dep-1",
             app_id="myapp",
             app_git_link="https://git/repo.git",
@@ -371,7 +360,8 @@ class TestDeployApplication:
         assert packer_inst.build.called
         assert tf_inst.plan.called and tf_inst.apply.called
         assert not tf_inst.destroy.called
-        lock_inst.acquire_or_wait.assert_called_once()
+        lock_inst.try_acquire.assert_called_once()
+        lock_inst.acquire.assert_not_called()
         lock_inst.release.assert_called_once()
 
     def test_multi_template_iterates_each_discovered(self, mocker, tmp_path):
@@ -380,7 +370,6 @@ class TestDeployApplication:
         os.makedirs(repo_path)
         _seed_terraform_dir(repo_path)
 
-        _silence_events(mocker, deploy_application)
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
@@ -390,7 +379,8 @@ class TestDeployApplication:
         _, packer_inst = _make_packer_mock(mocker)
         _, tf_inst = _make_tofu_executor_mock(mocker)
 
-        result = deploy_application.run(
+        result = deploy_application(
+            _Events(),
             deployment_id="dep-1",
             app_id="myapp",
             app_git_link="https://git/repo.git",
@@ -412,7 +402,6 @@ class TestDeployApplication:
         os.makedirs(repo_path)
         _seed_terraform_dir(repo_path)
 
-        _silence_events(mocker, deploy_application)
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
@@ -422,7 +411,8 @@ class TestDeployApplication:
         _, packer_inst = _make_packer_mock(mocker)
         _, tf_inst = _make_tofu_executor_mock(mocker)
 
-        result = deploy_application.run(
+        result = deploy_application(
+            _Events(),
             deployment_id="dep-1",
             app_id="myapp",
             app_git_link="https://git/repo.git",
@@ -435,16 +425,15 @@ class TestDeployApplication:
         assert result["status"] == "success"
         packer_inst.init.assert_not_called()
         packer_inst.build.assert_not_called()
-        lock_inst.acquire_or_wait.assert_not_called()
+        lock_inst.try_acquire.assert_not_called()
         assert tf_inst.apply.called
 
     def test_build_lock_wait_then_image_appears(self, mocker, tmp_path):
-        """acquire_or_wait False once → loop announces waiting then notices image arrived."""
+        """Lock busy → announce once, block in acquire(), then notice the image the other job built."""
         repo_path = str(tmp_path / "repo")
         os.makedirs(repo_path)
         _seed_terraform_dir(repo_path)
 
-        _silence_events(mocker, deploy_application)
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
@@ -455,13 +444,15 @@ class TestDeployApplication:
         mocker.patch("app.tasks.OpenStackService", return_value=os_inst)
 
         lock_inst = mocker.MagicMock()
-        lock_inst.acquire_or_wait.return_value = False  # blocked → wait branch
+        lock_inst.try_acquire.return_value = False  # another job builds it
         mocker.patch("app.tasks.PackerBuildLock", return_value=lock_inst)
+        events = _Events()
 
         _, packer_inst = _make_packer_mock(mocker)
         _, tf_inst = _make_tofu_executor_mock(mocker)
 
-        result = deploy_application.run(
+        result = deploy_application(
+            events,
             deployment_id="dep-1",
             app_id="myapp",
             app_git_link="https://git/repo.git",
@@ -474,6 +465,11 @@ class TestDeployApplication:
         assert result["status"] == "success"
         packer_inst.build.assert_not_called()
         assert tf_inst.apply.called
+        # Blocks once in Postgres instead of polling; says so once in the log.
+        lock_inst.acquire.assert_called_once()
+        waiting = [p for t, p in events.sent if t == "task-log" and "currently building" in p.get("message", "")]
+        assert len(waiting) == 1
+        lock_inst.release.assert_called_once()
 
     def test_packer_build_failure_skips_terraform(self, mocker, tmp_path):
         """A failing ``packer.build`` raises before any terraform method runs."""
@@ -481,7 +477,6 @@ class TestDeployApplication:
         os.makedirs(repo_path)
         _seed_terraform_dir(repo_path)
 
-        _silence_events(mocker, deploy_application)
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
@@ -492,7 +487,8 @@ class TestDeployApplication:
         _, tf_inst = _make_tofu_executor_mock(mocker)
 
         with pytest.raises(Failure):
-            deploy_application.run(
+            deploy_application(
+                _Events(),
                 deployment_id="dep-1",
                 app_id="myapp",
                 app_git_link="https://git/repo.git",
@@ -512,7 +508,6 @@ class TestDeployApplication:
         os.makedirs(repo_path)
         _seed_terraform_dir(repo_path)
 
-        _silence_events(mocker, deploy_application)
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
@@ -523,7 +518,8 @@ class TestDeployApplication:
         _, tf_inst = _make_tofu_executor_mock(mocker, apply_=False)
 
         with pytest.raises(Failure) as exc:
-            deploy_application.run(
+            deploy_application(
+                _Events(),
                 deployment_id="dep-2",
                 app_id="myapp",
                 app_git_link="https://git/repo.git",
@@ -539,10 +535,10 @@ class TestDeployApplication:
 
     def test_missing_envelope_raises_failure(self, mocker, tmp_path):
         """No ``openstack_envelope`` short-circuits with a Failure exception."""
-        _silence_events(mocker, deploy_application)
         _make_git_mock(mocker, str(tmp_path / "repo"))
         with pytest.raises(Failure) as exc:
-            deploy_application.run(
+            deploy_application(
+                _Events(),
                 deployment_id="dep-x",
                 app_id="myapp",
                 app_git_link="https://git/repo.git",
@@ -559,7 +555,6 @@ class TestDeployApplication:
         os.makedirs(repo_path)
         _seed_terraform_dir(repo_path)
 
-        _silence_events(mocker, deploy_application)
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
@@ -570,7 +565,8 @@ class TestDeployApplication:
         _make_tofu_executor_mock(mocker)
 
         secret = "SUPER-SECRET-PASSWORD-9999"
-        result = deploy_application.run(
+        result = deploy_application(
+            _Events(),
             deployment_id="dep-1",
             app_id="myapp",
             app_git_link="https://git/repo.git",
@@ -591,7 +587,6 @@ class TestDeployApplication:
         os.makedirs(repo_path)
         _seed_terraform_dir(repo_path)
 
-        _silence_events(mocker, deploy_application)
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
@@ -601,7 +596,8 @@ class TestDeployApplication:
         _make_packer_mock(mocker)
         _, tf_inst = _make_tofu_executor_mock(mocker)
 
-        deploy_application.run(
+        deploy_application(
+            _Events(),
             deployment_id="dep-1",
             app_id="myapp",
             app_git_link="https://git/repo.git",
@@ -628,14 +624,14 @@ class TestDestroyDeployment:
         os.makedirs(repo_path)
         _seed_terraform_dir(repo_path)
 
-        _silence_events(mocker, destroy_deployment)
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
         mocker.patch("app.tasks._discover_packer_templates", return_value=[])
         _, tf_inst = _make_tofu_executor_mock(mocker)
 
-        result = destroy_deployment.run(
+        result = destroy_deployment(
+            _Events(),
             deployment_id="dep-1",
             app_id="myapp",
             app_git_link="https://git/repo.git",
@@ -654,7 +650,6 @@ class TestDestroyDeployment:
         os.makedirs(repo_path)
         _seed_terraform_dir(repo_path)
 
-        _silence_events(mocker, destroy_deployment)
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
@@ -662,7 +657,8 @@ class TestDestroyDeployment:
         _make_tofu_executor_mock(mocker, destroy=False)
 
         with pytest.raises(Failure) as exc:
-            destroy_deployment.run(
+            destroy_deployment(
+                _Events(),
                 deployment_id="dep-1",
                 app_id="myapp",
                 app_git_link="https://git/repo.git",
@@ -686,7 +682,6 @@ class TestPauseResume:
         os.makedirs(repo_path)
         _seed_terraform_dir(repo_path)
 
-        _silence_events(mocker, task)
         _make_git_mock(mocker, repo_path)
         _make_clouds_config_mock(mocker)
         state = json.dumps(
@@ -705,7 +700,8 @@ class TestPauseResume:
         _make_tofu_executor_mock(mocker, state=state)
         _, os_inst = _make_openstack_service_mock(mocker)
 
-        result = task.run(
+        result = task(
+            _Events(),
             deployment_id="dep-1",
             app_id="myapp",
             app_git_link="https://git/repo.git",
@@ -732,14 +728,14 @@ class TestPauseResume:
         os.makedirs(repo_path)
         _seed_terraform_dir(repo_path)
 
-        _silence_events(mocker, pause_deployment)
         _make_git_mock(mocker, repo_path)
         _make_clouds_config_mock(mocker)
         _make_tofu_executor_mock(mocker, state='{"resources": []}')
         _, os_inst = _make_openstack_service_mock(mocker)
 
         with pytest.raises(Failure) as exc:
-            pause_deployment.run(
+            pause_deployment(
+                _Events(),
                 deployment_id="dep-1",
                 app_id="myapp",
                 app_git_link="https://git/repo.git",
@@ -757,7 +753,6 @@ class TestPauseResume:
         os.makedirs(repo_path)
         _seed_terraform_dir(repo_path)
 
-        _silence_events(mocker, pause_deployment)
         _make_git_mock(mocker, repo_path)
         _make_clouds_config_mock(mocker)
         state = json.dumps(
@@ -780,7 +775,8 @@ class TestPauseResume:
         mocker.patch("app.tasks.OpenStackService", return_value=os_inst)
 
         with pytest.raises(Failure) as exc:
-            pause_deployment.run(
+            pause_deployment(
+                _Events(),
                 deployment_id="dep-1",
                 app_id="myapp",
                 app_git_link="https://git/repo.git",
@@ -807,7 +803,6 @@ class TestRedeployResource:
         os.makedirs(repo_path)
         _seed_terraform_dir(repo_path)
 
-        _silence_events(mocker, redeploy_resource)
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
@@ -815,7 +810,8 @@ class TestRedeployResource:
         _, tf_inst = _make_tofu_executor_mock(mocker)
 
         addr = 'openstack_compute_instance_v2.team_ide["Team-A"]'
-        result = redeploy_resource.run(
+        result = redeploy_resource(
+            _Events(),
             deployment_id="dep-1",
             app_id="myapp",
             app_git_link="https://git/repo.git",
@@ -832,10 +828,10 @@ class TestRedeployResource:
 
     def test_invalid_address_short_circuits(self, mocker, tmp_path):
         """A malformed resource_address fails fast before any clone or terraform call."""
-        _silence_events(mocker, redeploy_resource)
         _make_git_mock(mocker, str(tmp_path / "repo"))
         with pytest.raises(Failure) as exc:
-            redeploy_resource.run(
+            redeploy_resource(
+                _Events(),
                 deployment_id="dep-1",
                 app_id="myapp",
                 app_git_link="https://git/repo.git",
@@ -846,3 +842,30 @@ class TestRedeployResource:
                 resource_address="; rm -rf /",
             )
         assert "invalid resource_address" in str(exc.value)
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(os.geteuid() != 0, reason="needs root to hand the checkout to another user")
+def test_commit_info_is_read_from_a_checkout_owned_by_the_slot_user(tmp_path):
+    """Regression: after hand_over() the worker (root) still reads the commit.
+
+    Git refuses a repository owned by another user ("dubious ownership");
+    the image tag then silently fell back to the release name.
+    """
+    import subprocess
+
+    from app.tasks import _extract_commit_info
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run = {"cwd": repo, "check": True, "capture_output": True}
+    subprocess.run(["git", "init", "-q"], **run)
+    (repo / "f").write_text("x")
+    subprocess.run(["git", "add", "f"], **run)
+    subprocess.run(["git", "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "msg"], **run)
+    expected = subprocess.run(["git", "rev-parse", "HEAD"], **run, text=True).stdout.strip()
+    for path in [repo, *repo.rglob("*")]:
+        os.chown(path, 20001, 20001, follow_symlinks=False)
+
+    info = _extract_commit_info(str(repo))
+    assert info["hash"] == expected and info["message"] == "msg"

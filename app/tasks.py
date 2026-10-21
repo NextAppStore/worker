@@ -1,12 +1,11 @@
 import json
 import os
 import re
-from typing import Any
+from typing import Any, Protocol
 
 import git
 
-from .celery_app import celery_app
-from .config import settings
+from . import job_context
 from .services import (
     OpenStackService,
     OpenTofuExecutor,
@@ -15,33 +14,26 @@ from .services import (
     PerTaskCloudsConfig,
     git_service,
 )
+from .services.opentofu_executor import StateBackend
 from .services.packer_discovery import PackerTemplateDiscoveryError, _discover_packer_templates, _PackerTemplate
 from .utils.logger import LogCategory, get_logger
 
 logger = get_logger(__name__)
 
 
-def _tfstate_schema_name(deployment_id: str) -> str:
-    """Postgres schema name for one deployment's OpenTofu state.
+class JobEvents(Protocol):
+    """Where a job's live events go (``job_queue.TaskEventSink``)."""
 
-    UUIDs contain hyphens, which would force every reference to be
-    double-quoted. Replacing hyphens with underscores keeps the schema
-    a plain unquoted identifier and avoids escaping hazards in any
-    backend-config plumbing.
-    """
-    return f"deployment_{deployment_id.replace('-', '_')}"
+    def send_event(self, event_type: str, **payload: Any) -> None: ...
 
 
 class Failure(Exception):
-    """Custom exception that carries deployment details for Celery.
+    """A job failed; carries what it produced up to that point.
 
-    The full failure payload is serialised once into ``args[0]`` as a JSON
-    string. The backend's celery event listener parses that JSON back via
-    a ``Failure\\('<json>'\\)`` regex over the traceback.
-
-    ``__reduce__`` is overridden so pickle reconstructs the exception via
-    the ``_from_payload`` classmethod, which accepts the single JSON string
-    directly.
+    ``job_queue.failure_columns`` stores the log, the error line, the commit
+    and the outputs of a half-finished apply on the task row — straight from
+    these attributes, no serialisation round-trip and no parsing of the
+    traceback text.
     """
 
     def __init__(
@@ -49,56 +41,25 @@ class Failure(Exception):
         message: str,
         deployment_id: str,
         logs_dict: list[dict[str, Any]] | dict[str, Any],
-        tf_state: str | None = None,
         commit_info: dict[str, Any] | None = None,
         terraform_outputs: dict[str, Any] | None = None,
     ):
+        super().__init__(message)
+        self.message = message
         self.deployment_id = deployment_id
         self.logs_dict = logs_dict
-        self.tf_state = tf_state
         self.commit_info = commit_info
         self.terraform_outputs = terraform_outputs
 
-        # Encode all data as JSON in the exception message
-        data = {
-            "error": message,
-            "deployment_id": deployment_id,
-            "logs": logs_dict,
-            "tf_state": tf_state,
-            "commit_info": commit_info,
-            "terraform_outputs": terraform_outputs,
-        }
-        super().__init__(json.dumps(data))
-
-    @classmethod
-    def _from_payload(cls, payload: str) -> "Failure":
-        """Reconstruct a Failure from its serialised JSON payload.
-
-        Used by ``__reduce__`` so pickle can round-trip the exception.
-        """
-        data = json.loads(payload)
-        instance = cls.__new__(cls)
-        instance.deployment_id = data.get("deployment_id", "")
-        instance.logs_dict = data.get("logs")
-        instance.tf_state = data.get("tf_state")
-        instance.commit_info = data.get("commit_info")
-        instance.terraform_outputs = data.get("terraform_outputs")
-        Exception.__init__(instance, payload)
-        return instance
-
-    def __reduce__(self):
-        # The single-arg constructor here is ``_from_payload``; args[0] is
-        # the JSON string we built in __init__.
-        return (Failure._from_payload, (self.args[0] if self.args else "{}",))
-
-    def __repr__(self) -> str:
-        # Pin the repr format that the backend's celery event listener
-        # relies on (regex ``Failure\('(.+)'\)``).
-        return f"Failure({self.args[0]!r})" if self.args else "Failure()"
-
     def to_dict(self) -> dict[str, Any]:
-        """Convert exception data to dict for serialization"""
-        return json.loads(str(self))
+        """The failure as a dict (error, logs, commit, outputs)."""
+        return {
+            "error": self.message,
+            "deployment_id": self.deployment_id,
+            "logs": self.logs_dict,
+            "commit_info": self.commit_info,
+            "terraform_outputs": self.terraform_outputs,
+        }
 
 
 # --- Variable encoding for Packer/OpenTofu CLI ----------------------------
@@ -342,7 +303,7 @@ _PHASES_REDEPLOY = (
 )
 # Pause / resume share the destroy preamble — git clone at the same
 # release tag, materialise clouds.yaml, tofu init so we can pull
-# the canonical state from the pg backend. The hot phase is the
+# the canonical state from the backend API. The hot phase is the
 # server stop / start loop. CLEANUP runs the repo shred and (for the
 # log) a final state pull, mirroring destroy's tail.
 _PHASES_PAUSE = (
@@ -402,57 +363,27 @@ class _PhaseTracker:
         )
 
 
-def _tofu_executor(terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema) -> OpenTofuExecutor:
-    """Build an OpenTofuExecutor bound to the deployment's pg-backend schema."""
-    return OpenTofuExecutor(
-        terraform_dir,
-        env_vars=openstack_env,
-        backend_conn_str=tfstate_conn_str,
-        backend_schema_name=tfstate_schema,
-    )
+def collect_terraform_outputs_helper(terraform_dir, openstack_env, state_backend, task_logger):
+    """Collect OpenTofu outputs even on partial success. ``None`` on failure.
 
-
-def collect_terraform_state_helper(
-    terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger, *, local_fallback=False
-):
-    """Snapshot the OpenTofu state for the task row (best-effort).
-
-    With the pg backend the canonical state lives in Postgres; this
-    snapshot is used for debugging only. When ``local_fallback`` is set
-    (deploy path), a missing/empty pull falls back to reading the local
-    ``terraform.tfstate`` file for legacy/test modes that don't configure
-    a remote backend. Returns ``None`` when nothing could be read.
+    The state itself is not collected: OpenTofu writes it to the backend API
+    (``/internal/tfstate``), which keeps the only copy.
     """
-    if not (terraform_dir and os.path.exists(terraform_dir)):
-        return None
-    try:
-        pulled = _tofu_executor(terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema).state_pull()
-        if pulled or not local_fallback:
-            return pulled
-    except Exception as e:
-        task_logger.warning(f"Could not pull OpenTofu state: {e}", category=LogCategory.WARNING)
-        if not local_fallback:
-            return None
-
-    # Legacy fallback — only relevant when no pg backend is configured.
-    tfstate_path = os.path.join(terraform_dir, "terraform.tfstate")
-    if os.path.exists(tfstate_path):
-        try:
-            with open(tfstate_path) as f:
-                return f.read()
-        except Exception as e:
-            task_logger.warning(f"Could not read OpenTofu state: {e}", category=LogCategory.WARNING)
-    return None
-
-
-def collect_terraform_outputs_helper(terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger):
-    """Collect OpenTofu outputs even on partial success. ``None`` on failure."""
     if terraform_dir and os.path.exists(terraform_dir):
         try:
-            return _tofu_executor(terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema).output()
+            return OpenTofuExecutor(terraform_dir, env_vars=openstack_env, state_backend=state_backend).output()
         except Exception as e:
             task_logger.warning(f"Could not read OpenTofu outputs: {e}", category=LogCategory.WARNING)
     return None
+
+
+def _clone_for_job(app_git_link: str, deployment_id: str, release: str) -> str:
+    """Clone the app at ``release`` and give the checkout to the job slot's user."""
+    repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=deployment_id, tag=release)
+    # The tools run as the slot's user (job_context): they write .terraform/
+    # and Packer output into the checkout.
+    job_context.current().hand_over(repo_path)
+    return repo_path
 
 
 def _extract_commit_info(repo_path: str) -> dict[str, Any]:
@@ -463,6 +394,11 @@ def _extract_commit_info(repo_path: str) -> dict[str, Any]:
     repo without a readable HEAD degrades to a warning, not a hard fail.
     """
     repo = git.Repo(repo_path)
+    # The checkout belongs to the job slot's user (``_clone_for_job``), and
+    # git refuses to read a repository owned by someone else ("dubious
+    # ownership"). Mark this one directory safe, for this repo object only;
+    # without it the image tag fell back to the release name.
+    repo.git.update_environment(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="safe.directory", GIT_CONFIG_VALUE_0=repo_path)
     commit = repo.head.commit
     return {
         "hash": commit.hexsha,
@@ -479,7 +415,7 @@ def _build_image_names(templates: list[_PackerTemplate], app_id: str, image_tag:
     flat ``{"default": "<app_id>-<tag>"}`` shape; multi-image apps get one
     ``<app_id>-<key>-<tag>`` entry per template. Used by destroy/redeploy,
     which must name the same images the original deploy built so
-    OpenTofu's variable validation matches the pg-backend state.
+    OpenTofu's variable validation matches the stored state.
     """
     if not templates or (len(templates) == 1 and templates[0].key == "default"):
         return {"default": f"{app_id}-{image_tag}"}
@@ -554,115 +490,105 @@ def _build_one_packer_image(
     build_phase = PHASE_PACKER_BUILD if is_legacy else f"{PHASE_PACKER_BUILD}:{tmpl.key}"
 
     build_lock = PackerBuildLock(project_id, image_name)
-    wait_announced = False
     try:
-        while True:
-            # If the image already exists, skip the build and the lock.
-            exists, image_id = openstack_service.check_image_exists(image_name)
-            if exists:
-                task_logger.success(
-                    f"{log_prefix}Image '{image_name}' already exists (ID: {image_id}). Skipping Packer build.",
-                    category=LogCategory.STATUS,
-                )
-                break
-
-            held = build_lock.acquire_or_wait()
-            if not held:
-                # Another worker is still building the same image. Surface
-                # this in the per-deployment log once so the frontend's
-                # live tail shows *something* during the 5-second poll
-                # cycles — without it the browser sees no events and looks
-                # frozen.
-                if not wait_announced:
-                    task_logger.info(
-                        f"{log_prefix}Another worker is currently building image '{image_name}'. Waiting…",
-                        category=LogCategory.STATUS,
-                    )
-                    wait_announced = True
-                # We slept inside acquire_or_wait; re-check Glance.
-                continue
-
-            # Re-check after acquiring: another worker may have finished its
-            # build between our last check and our lock acquisition.
-            exists, image_id = openstack_service.check_image_exists(image_name)
-            if exists:
-                task_logger.success(
-                    f"{log_prefix}Image '{image_name}' built by another worker (ID: {image_id}). Skipping.",
-                    category=LogCategory.STATUS,
-                )
-                break
-
-            task_logger.info(
-                f"{log_prefix}Image '{image_name}' does not exist. Building...",
-                category=LogCategory.OPERATION,
-            )
-
-            # Pick the right packer working directory: legacy uses
-            # ``packer/`` directly; multi uses ``packer/<key>/``. Template
-            # file name is always ``template.pkr.hcl`` relative to that
-            # directory.
-            packer_dir = os.path.join(repo_path, "packer") if is_legacy else os.path.join(repo_path, "packer", tmpl.key)
-            packer = PackerExecutor(
-                packer_dir,
-                env_vars=openstack_env,
-                output_callback=stream_line,
-            )
-
-            # Per-template Packer variables. Legacy shape is the flat
-            # ``user_vars["packer"][var_name]``; multi shape is nested
-            # ``user_vars["packer"][template_key][var_name]``.
-            if is_legacy:
-                user_packer = user_vars.get("packer", {})
-            else:
-                user_packer = (user_vars.get("packer") or {}).get(tmpl.key, {}) or {}
-            packer_vars = {**user_packer}
-            packer_vars["image_name"] = image_name
-            packer_vars = encode_packer_vars(packer_vars)
-
-            task_logger.info(
-                f"{log_prefix}Packer variable keys",
-                category=LogCategory.OPERATION,
-                keys=list(packer_vars.keys()),
-                template=tmpl.key,
-                image_name=image_name,
-            )
-
-            phase_tracker.mark(init_phase, f"{log_prefix}Initializing Packer plugins")
-            success, stdout, stderr = packer.init()
-            if not success:
-                if stdout:
-                    task_logger.command_output("packer_init_stdout", stdout, returncode=1)
-                if stderr:
-                    task_logger.command_output("packer_init_stderr", stderr, returncode=1)
-                raise Exception(f"{log_prefix}Packer init failed")
-
-            phase_tracker.mark(validate_phase, f"{log_prefix}Validating Packer template")
-            success, stdout, stderr = packer.validate("template.pkr.hcl", packer_vars)
-            if not success:
-                raise Exception(f"{log_prefix}Packer validation failed: {stderr}")
-
-            phase_tracker.mark(
-                build_phase,
-                f"{log_prefix}Building image '{image_name}' (this may take minutes)",
-            )
-            success, output = packer.build("template.pkr.hcl", packer_vars)
-            if not success:
-                raise Exception(f"{log_prefix}Packer build failed: {output}")
-
+        # Nothing to build if the image is already there; no lock needed.
+        exists, image_id = openstack_service.check_image_exists(image_name)
+        if exists:
             task_logger.success(
-                f"{log_prefix}Image '{image_name}' built successfully",
+                f"{log_prefix}Image '{image_name}' already exists (ID: {image_id}). Skipping Packer build.",
                 category=LogCategory.STATUS,
             )
-            break
+            return
+
+        if not build_lock.try_acquire():
+            # Another job is building the same image. Say so once in the
+            # per-deployment log (otherwise the live tail looks frozen),
+            # then wait inside Postgres until its lock is released.
+            task_logger.info(
+                f"{log_prefix}Another worker is currently building image '{image_name}'. Waiting…",
+                category=LogCategory.STATUS,
+            )
+            build_lock.acquire()
+
+        # Re-check under the lock: the other job (or one that finished just
+        # before we looked) may have built it meanwhile.
+        exists, image_id = openstack_service.check_image_exists(image_name)
+        if exists:
+            task_logger.success(
+                f"{log_prefix}Image '{image_name}' built by another worker (ID: {image_id}). Skipping.",
+                category=LogCategory.STATUS,
+            )
+            return
+
+        task_logger.info(
+            f"{log_prefix}Image '{image_name}' does not exist. Building...",
+            category=LogCategory.OPERATION,
+        )
+
+        # Pick the right packer working directory: legacy uses
+        # ``packer/`` directly; multi uses ``packer/<key>/``. Template
+        # file name is always ``template.pkr.hcl`` relative to that
+        # directory.
+        packer_dir = os.path.join(repo_path, "packer") if is_legacy else os.path.join(repo_path, "packer", tmpl.key)
+        packer = PackerExecutor(
+            packer_dir,
+            env_vars=openstack_env,
+            output_callback=stream_line,
+        )
+
+        # Per-template Packer variables. Legacy shape is the flat
+        # ``user_vars["packer"][var_name]``; multi shape is nested
+        # ``user_vars["packer"][template_key][var_name]``.
+        if is_legacy:
+            user_packer = user_vars.get("packer", {})
+        else:
+            user_packer = (user_vars.get("packer") or {}).get(tmpl.key, {}) or {}
+        packer_vars = {**user_packer}
+        packer_vars["image_name"] = image_name
+        packer_vars = encode_packer_vars(packer_vars)
+
+        task_logger.info(
+            f"{log_prefix}Packer variable keys",
+            category=LogCategory.OPERATION,
+            keys=list(packer_vars.keys()),
+            template=tmpl.key,
+            image_name=image_name,
+        )
+
+        phase_tracker.mark(init_phase, f"{log_prefix}Initializing Packer plugins")
+        success, stdout, stderr = packer.init()
+        if not success:
+            if stdout:
+                task_logger.command_output("packer_init_stdout", stdout, returncode=1)
+            if stderr:
+                task_logger.command_output("packer_init_stderr", stderr, returncode=1)
+            raise Exception(f"{log_prefix}Packer init failed")
+
+        phase_tracker.mark(validate_phase, f"{log_prefix}Validating Packer template")
+        success, stdout, stderr = packer.validate("template.pkr.hcl", packer_vars)
+        if not success:
+            raise Exception(f"{log_prefix}Packer validation failed: {stderr}")
+
+        phase_tracker.mark(
+            build_phase,
+            f"{log_prefix}Building image '{image_name}' (this may take minutes)",
+        )
+        success, output = packer.build("template.pkr.hcl", packer_vars)
+        if not success:
+            raise Exception(f"{log_prefix}Packer build failed: {output}")
+
+        task_logger.success(
+            f"{log_prefix}Image '{image_name}' built successfully",
+            category=LogCategory.STATUS,
+        )
     except Exception as e:
         raise Exception(f"Packer error: {str(e)}")
     finally:
         build_lock.release()
 
 
-@celery_app.task(bind=True, name="tasks.deploy_application")
 def deploy_application(
-    self,
+    events: JobEvents,
     deployment_id: str,
     app_id: str,
     app_git_link: str,
@@ -670,6 +596,7 @@ def deploy_application(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    state_backend: StateBackend | None = None,
 ):
     """
     Deploy an application using OpenTofu and Packer
@@ -686,20 +613,19 @@ def deploy_application(
             worker on rollout (we raise immediately if it's missing).
 
     Returns:
-        dict: status, logs, tf_state, commit_info, terraform_outputs
+        dict: status, logs, commit_info, terraform_outputs
     """
     task_logger = get_logger(f"deploy:{deployment_id}", correlation_id=deployment_id)
 
-    # Wire the per-deployment logger to Celery's event bus. Every buffered
-    # log entry now becomes a ``task-log`` event, and ``task_logger.progress``
-    # emits ``task-progress``. The backend's listener picks both up and
-    # forwards them via the in-process pubsub to any open SSE subscriber.
-    bound_task = self
+    # Wire the per-deployment logger to the task's event sink. Every buffered
+    # log entry becomes a ``task-log`` event, and ``task_logger.progress``
+    # emits ``task-progress``; both land in ``task_events``, where the
+    # backend's live stream reads them.
+    bound_task = events
 
     def _emit(event_name: str, payload: dict[str, Any]) -> None:
-        # ``deployment_id`` is duplicated into every event so the backend
-        # listener doesn't need a DB lookup to figure out which deployment
-        # the event belongs to.
+        # ``deployment_id`` rides along in every event, as the stream's
+        # payloads always carried it.
         bound_task.send_event(event_name, deployment_id=deployment_id, **payload)
 
     task_logger.set_event_emitter(_emit)
@@ -709,33 +635,18 @@ def deploy_application(
     phase_tracker = _PhaseTracker(task_logger, _PHASES_WITH_PACKER)
 
     repo_path = None
-    tf_state = None
     outputs = None
     commit_info = None
     terraform_dir = None
     openstack_env: dict[str, str] = {}
     clouds_config: PerTaskCloudsConfig | None = None
 
-    # OpenTofu's pg backend lives in a worker-only Postgres. Configured
-    # at deploy/destroy time by writing a `pg_backend_override.tf` next
-    # to the cloned repo's terraform/ directory. One schema per
-    # deployment isolates state and locks.
-    tfstate_conn_str = settings.TFSTATE_DATABASE_URL or None
-    tfstate_schema = _tfstate_schema_name(deployment_id)
-
     # Default teams to empty dict if not provided
     if teams is None:
         teams = {}
 
-    def collect_terraform_state():
-        return collect_terraform_state_helper(
-            terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger, local_fallback=True
-        )
-
     def collect_terraform_outputs():
-        return collect_terraform_outputs_helper(
-            terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger
-        )
+        return collect_terraform_outputs_helper(terraform_dir, openstack_env, state_backend, task_logger)
 
     try:
         phase_tracker.mark(PHASE_STARTING, "Starting deployment")
@@ -763,7 +674,7 @@ def deploy_application(
         phase_tracker.mark(PHASE_GIT_CLONE, "Cloning repository")
         task_logger.info(f"Cloning repository: {app_git_link}", category=LogCategory.OPERATION)
         try:
-            repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=deployment_id, tag=release)
+            repo_path = _clone_for_job(app_git_link, deployment_id, release)
 
             # Get commit info
             try:
@@ -828,7 +739,7 @@ def deploy_application(
         def _stream_line(tool: str, line: str) -> None:
             task_logger.tool_output_line(tool, line)
 
-        # Phase 3: Packer (optional) — guarded by a Redis lock keyed on
+        # Phase 3: Packer (optional) — guarded by a Postgres advisory lock keyed on
         # (project_id, image_name) so two parallel workers can't both kick
         # off a build for the same image and end up with duplicate Glance
         # entries plus wasted compute. For multi-image apps each template
@@ -867,8 +778,7 @@ def deploy_application(
             terraform = OpenTofuExecutor(
                 terraform_dir,
                 env_vars=openstack_env,
-                backend_conn_str=tfstate_conn_str,
-                backend_schema_name=tfstate_schema,
+                state_backend=state_backend,
                 output_callback=_stream_line,
             )
 
@@ -944,10 +854,9 @@ def deploy_application(
                 raise Exception("OpenTofu apply failed")
             task_logger.success("OpenTofu resources created", category=LogCategory.STATUS)
 
-            # Collect outputs and state
+            # Collect outputs
             phase_tracker.mark(PHASE_OUTPUTS_AND_CLEANUP, "Collecting outputs")
             outputs = collect_terraform_outputs()
-            tf_state = collect_terraform_state()
 
             if outputs:
                 task_logger.info(
@@ -956,7 +865,6 @@ def deploy_application(
 
         except Exception as e:
             # Try to collect partial results even on failure
-            tf_state = collect_terraform_state()
             outputs = collect_terraform_outputs()
 
             # Best-effort cleanup: a half-finished `tofu apply` typically
@@ -984,8 +892,6 @@ def deploy_application(
                     if teams:
                         cleanup_tf_vars["users"] = teams
                     terraform.destroy(variables=encode_terraform_vars(cleanup_tf_vars))
-                    # Refresh state after destroy so the persisted record reflects cleanup.
-                    tf_state = collect_terraform_state()
                 except Exception as cleanup_error:
                     task_logger.warning(
                         f"OpenTofu cleanup failed: {cleanup_error}",
@@ -1009,20 +915,17 @@ def deploy_application(
             "status": "success",
             "deployment_id": deployment_id,
             "logs": task_logger.get_logs_dict(),
-            "tf_state": tf_state,
             "commit_info": commit_info,
             "terraform_outputs": outputs,
         }
 
-        # Return result (sent via task-succeeded event)
+        # Recorded on the task row by the runner (job_queue.success_columns).
         return result
 
     except Exception as e:
         task_logger.exception(f"Deployment failed: {str(e)}", exception=e, deployment_id=deployment_id)
 
-        # Try to collect any available state/outputs even on failure
-        if not tf_state:
-            tf_state = collect_terraform_state()
+        # Try to collect any available outputs even on failure
         if not outputs:
             outputs = collect_terraform_outputs()
 
@@ -1031,7 +934,6 @@ def deploy_application(
             message=str(e),
             deployment_id=deployment_id,
             logs_dict=task_logger.get_logs_dict(),
-            tf_state=tf_state,
             commit_info=commit_info,
             terraform_outputs=outputs,
         )
@@ -1042,9 +944,8 @@ def deploy_application(
         _cleanup_task_resources(clouds_config, repo_path, task_logger)
 
 
-@celery_app.task(bind=True, name="tasks.destroy_deployment")
 def destroy_deployment(
-    self,
+    events: JobEvents,
     deployment_id: str,
     app_id: str,
     app_git_link: str,
@@ -1052,26 +953,27 @@ def destroy_deployment(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    state_backend: StateBackend | None = None,
 ):
     """Tear down a deployment via ``tofu destroy``.
 
     Mirrors ``deploy_application``'s setup (git clone at the same release
-    tag, materialise the per-task clouds.yaml, configure the same pg
-    backend schema) so OpenTofu sees the exact same state it built.
+    tag, materialise the per-task clouds.yaml, point OpenTofu at the same
+    state in the backend API) so OpenTofu sees the exact state it built.
     Then runs ``tofu destroy -auto-approve`` instead of
     ``plan + apply``. Same Packer image is left in Glance so a future
     deploy of the same commit doesn't have to rebuild it.
 
     All progress and log events flow through the same ``StructuredLogger``
-    + Celery custom-event pipeline as deploy, so the frontend's live
-    SSE stream renders the destroy run identically to a deploy.
+    + task event pipeline as deploy, so the frontend's live SSE stream
+    renders the destroy run identically to a deploy.
 
     Args mirror ``deploy_application`` so the backend can re-dispatch
     the same persisted values without translation.
     """
     task_logger = get_logger(f"destroy:{deployment_id}", correlation_id=deployment_id)
 
-    bound_task = self
+    bound_task = events
 
     def _emit(event_name: str, payload: dict[str, Any]) -> None:
         bound_task.send_event(event_name, deployment_id=deployment_id, **payload)
@@ -1080,25 +982,16 @@ def destroy_deployment(
     phase_tracker = _PhaseTracker(task_logger, _PHASES_DESTROY)
 
     repo_path = None
-    tf_state: str | None = None
     commit_info: dict[str, Any] | None = None
     terraform_dir: str | None = None
     openstack_env: dict[str, str] = {}
     clouds_config: PerTaskCloudsConfig | None = None
-
-    tfstate_conn_str = settings.TFSTATE_DATABASE_URL or None
-    tfstate_schema = _tfstate_schema_name(deployment_id)
 
     if teams is None:
         teams = {}
 
     def _stream_line(tool: str, line: str) -> None:
         task_logger.tool_output_line(tool, line)
-
-    def collect_terraform_state():
-        return collect_terraform_state_helper(
-            terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger
-        )
 
     try:
         phase_tracker.mark(PHASE_STARTING, "Starting destroy")
@@ -1121,11 +1014,11 @@ def destroy_deployment(
         phase_tracker.mark(PHASE_GIT_CLONE, "Cloning repository at original release tag")
         task_logger.info(
             f"Cloning {app_git_link} at {release} (same ref as the original deploy "
-            "so OpenTofu code matches the pg-backend state)",
+            "so OpenTofu code matches the stored state)",
             category=LogCategory.OPERATION,
         )
         try:
-            repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=deployment_id, tag=release)
+            repo_path = _clone_for_job(app_git_link, deployment_id, release)
             try:
                 commit_info = _extract_commit_info(repo_path)
                 task_logger.resource_info(
@@ -1189,8 +1082,7 @@ def destroy_deployment(
         terraform = OpenTofuExecutor(
             terraform_dir,
             env_vars=openstack_env,
-            backend_conn_str=tfstate_conn_str,
-            backend_schema_name=tfstate_schema,
+            state_backend=state_backend,
             output_callback=_stream_line,
         )
 
@@ -1229,7 +1121,6 @@ def destroy_deployment(
         task_logger.success("OpenTofu resources destroyed", category=LogCategory.STATUS)
 
         phase_tracker.mark(PHASE_CLEANUP, "Pulling final state")
-        tf_state = collect_terraform_state()
 
         task_logger.success(f"Deployment {deployment_id} destroyed successfully", category=LogCategory.STATUS)
 
@@ -1240,7 +1131,6 @@ def destroy_deployment(
             "status": "success",
             "deployment_id": deployment_id,
             "logs": task_logger.get_logs_dict(),
-            "tf_state": tf_state,
             "commit_info": commit_info,
             # No outputs — destroy doesn't produce any. Field is kept for
             # event-listener parity with deploy_application's payload.
@@ -1249,13 +1139,10 @@ def destroy_deployment(
 
     except Exception as e:
         task_logger.exception(f"Destroy failed: {str(e)}", exception=e, deployment_id=deployment_id)
-        if not tf_state:
-            tf_state = collect_terraform_state()
         raise Failure(
             message=str(e),
             deployment_id=deployment_id,
             logs_dict=task_logger.get_logs_dict(),
-            tf_state=tf_state,
             commit_info=commit_info,
             terraform_outputs={},
         )
@@ -1269,7 +1156,7 @@ def destroy_deployment(
 # ----------------------------------------------------------------
 #
 # Both tasks share the destroy preamble (git clone at the same release
-# tag → per-task clouds.yaml → tofu init pointed at the pg backend)
+# tag → per-task clouds.yaml → tofu init pointed at the state backend)
 # so we can pull the canonical OpenTofu state and read back which
 # compute instances belong to this deployment. The hot phase is a
 # CLI-driven stop/start loop; OpenTofu state is left untouched. Server
@@ -1278,7 +1165,7 @@ def destroy_deployment(
 
 
 def _extract_compute_instance_ids(state_json: str | None) -> list[str]:
-    """Return server IDs from an OpenTofu pg-backend state dump.
+    """Return server IDs from an OpenTofu state dump (``tofu state pull``).
 
     OpenTofu's serialised state shape is
     ``{"resources": [{"type": "...", "instances": [{"attributes": {"id": "..."}}]}]}``.
@@ -1309,7 +1196,7 @@ def _extract_compute_instance_ids(state_json: str | None) -> list[str]:
 
 
 def _run_compute_lifecycle(
-    self,
+    events: JobEvents,
     deployment_id: str,
     app_id: str,
     app_git_link: str,
@@ -1318,6 +1205,7 @@ def _run_compute_lifecycle(
     teams: dict[str, list] | None,
     openstack_envelope: dict[str, Any] | None,
     *,
+    state_backend: StateBackend | None,
     action: str,  # "pause" | "resume" — only for log/error labels
     phases: tuple[str, ...],
     server_phase: str,
@@ -1339,7 +1227,7 @@ def _run_compute_lifecycle(
     label = f"{action}:{deployment_id}"
     task_logger = get_logger(label, correlation_id=deployment_id)
 
-    bound_task = self
+    bound_task = events
 
     def _emit(event_name: str, payload: dict[str, Any]) -> None:
         bound_task.send_event(event_name, deployment_id=deployment_id, **payload)
@@ -1351,9 +1239,6 @@ def _run_compute_lifecycle(
     terraform_dir: str | None = None
     openstack_env: dict[str, str] = {}
     clouds_config: PerTaskCloudsConfig | None = None
-
-    tfstate_conn_str = settings.TFSTATE_DATABASE_URL or None
-    tfstate_schema = _tfstate_schema_name(deployment_id)
 
     if teams is None:
         teams = {}
@@ -1379,11 +1264,7 @@ def _run_compute_lifecycle(
 
         phase_tracker.mark(PHASE_GIT_CLONE, "Cloning repository at original release tag")
         try:
-            repo_path = git_service.clone_release(
-                git_url=app_git_link,
-                deployment_id=deployment_id,
-                tag=release,
-            )
+            repo_path = _clone_for_job(app_git_link, deployment_id, release)
             task_logger.success("Repository cloned", category=LogCategory.STATUS)
         except Exception as e:
             raise Exception(f"Git clone failed: {str(e)}")
@@ -1400,8 +1281,7 @@ def _run_compute_lifecycle(
         terraform = OpenTofuExecutor(
             terraform_dir,
             env_vars=openstack_env,
-            backend_conn_str=tfstate_conn_str,
-            backend_schema_name=tfstate_schema,
+            state_backend=state_backend,
             output_callback=_stream_line,
         )
 
@@ -1415,7 +1295,7 @@ def _run_compute_lifecycle(
             raise Exception("OpenTofu init failed")
         task_logger.success("OpenTofu initialization completed", category=LogCategory.STATUS)
 
-        # Pull the canonical state from the pg backend, then walk it
+        # Pull the canonical state from the backend API, then walk it
         # to find every compute instance attached to this deployment.
         # An empty list usually means the deployment never reached a
         # successful apply — surface that as a hard error rather than
@@ -1475,18 +1355,9 @@ def _run_compute_lifecycle(
             joined = "; ".join(f"{sid}: {err}" for sid, err in failures)
             raise Exception(f"{action} failed for {len(failures)}/{len(server_ids)} server(s): {joined}")
 
-        phase_tracker.mark(PHASE_CLEANUP, "Pulling final state snapshot")
-        # State doesn't change for pause/resume (the resources still
-        # exist, just in a different power state), but we pull it
-        # again so the task row gets a fresh snapshot for debugging.
-        try:
-            tf_state_post = terraform.state_pull()
-        except Exception as e:
-            task_logger.warning(
-                f"Could not pull OpenTofu state post-{action}: {e}",
-                category=LogCategory.WARNING,
-            )
-            tf_state_post = state_dump
+        # State doesn't change for pause/resume (the resources still exist,
+        # just in a different power state); the backend keeps it as it is.
+        phase_tracker.mark(PHASE_CLEANUP, "Cleaning up")
 
         task_logger.success(
             f"Deployment {deployment_id} {action}d successfully",
@@ -1497,11 +1368,9 @@ def _run_compute_lifecycle(
             "status": "success",
             "deployment_id": deployment_id,
             "logs": task_logger.get_logs_dict(),
-            "tf_state": tf_state_post,
             "commit_info": None,
             # Pause/resume don't generate or change OpenTofu outputs —
-            # field is kept for event-listener parity with the deploy
-            # / destroy payload shape.
+            # an empty dict leaves the deploy's outputs the latest ones.
             "terraform_outputs": {},
         }
 
@@ -1511,7 +1380,6 @@ def _run_compute_lifecycle(
             message=str(e),
             deployment_id=deployment_id,
             logs_dict=task_logger.get_logs_dict(),
-            tf_state=None,
             commit_info=None,
             terraform_outputs={},
         )
@@ -1520,9 +1388,8 @@ def _run_compute_lifecycle(
         _cleanup_task_resources(clouds_config, repo_path, task_logger)
 
 
-@celery_app.task(bind=True, name="tasks.pause_deployment")
 def pause_deployment(
-    self,
+    events: JobEvents,
     deployment_id: str,
     app_id: str,
     app_git_link: str,
@@ -1530,6 +1397,7 @@ def pause_deployment(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    state_backend: StateBackend | None = None,
 ):
     """Halt a deployment by stopping all of its compute instances.
 
@@ -1539,7 +1407,7 @@ def pause_deployment(
     happy to tear down SHUTOFF instances).
     """
     return _run_compute_lifecycle(
-        self,
+        events,
         deployment_id,
         app_id,
         app_git_link,
@@ -1547,6 +1415,7 @@ def pause_deployment(
         user_vars,
         teams,
         openstack_envelope,
+        state_backend=state_backend,
         action="pause",
         phases=_PHASES_PAUSE,
         server_phase=PHASE_SERVER_STOP,
@@ -1554,9 +1423,8 @@ def pause_deployment(
     )
 
 
-@celery_app.task(bind=True, name="tasks.resume_deployment")
 def resume_deployment(
-    self,
+    events: JobEvents,
     deployment_id: str,
     app_id: str,
     app_git_link: str,
@@ -1564,6 +1432,7 @@ def resume_deployment(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    state_backend: StateBackend | None = None,
 ):
     """Resume a paused deployment by starting all of its compute instances.
 
@@ -1571,7 +1440,7 @@ def resume_deployment(
     code paths stay symmetric and easy to compare side-by-side.
     """
     return _run_compute_lifecycle(
-        self,
+        events,
         deployment_id,
         app_id,
         app_git_link,
@@ -1579,6 +1448,7 @@ def resume_deployment(
         user_vars,
         teams,
         openstack_envelope,
+        state_backend=state_backend,
         action="resume",
         phases=_PHASES_RESUME,
         server_phase=PHASE_SERVER_START,
@@ -1594,7 +1464,7 @@ def resume_deployment(
 # ``tofu apply -replace=<addr> -target=<addr>``. Everything else in
 # the deployment stays untouched. The backend whitelists the address
 # against the cached TF state before dispatch; we re-check the address
-# shape here as defense in depth. Same per-task clouds.yaml + pg backend
+# shape here as defense in depth. Same per-task clouds.yaml + state backend
 # schema as deploy/destroy, so the apply sees the same state file.
 
 _REDEPLOY_ADDRESS_RE = re.compile(
@@ -1735,9 +1605,8 @@ def _reconcile_scoped_vars_to_roster(
     return reconciled
 
 
-@celery_app.task(bind=True, name="tasks.redeploy_resource")
 def redeploy_resource(
-    self,
+    events: JobEvents,
     deployment_id: str,
     app_id: str,
     app_git_link: str,
@@ -1746,6 +1615,7 @@ def redeploy_resource(
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
     resource_address: str | None = None,
+    state_backend: StateBackend | None = None,
 ):
     """Replace ONE compute instance via ``-target`` + ``-replace``.
 
@@ -1755,12 +1625,12 @@ def redeploy_resource(
     (e.g. ``openstack_compute_instance_v2.team_ide["Team-A"]``) the
     user clicked.
 
-    Returns the same payload shape as deploy/destroy so the celery
-    event listener stays generic.
+    Returns the same payload shape as deploy/destroy so recording the
+    result stays generic.
     """
     task_logger = get_logger(f"redeploy:{deployment_id}", correlation_id=deployment_id)
 
-    bound_task = self
+    bound_task = events
 
     def _emit(event_name: str, payload: dict[str, Any]) -> None:
         bound_task.send_event(event_name, deployment_id=deployment_id, **payload)
@@ -1769,15 +1639,11 @@ def redeploy_resource(
     phase_tracker = _PhaseTracker(task_logger, _PHASES_REDEPLOY)
 
     repo_path: str | None = None
-    tf_state: str | None = None
     outputs: dict[str, Any] | None = None
     commit_info: dict[str, Any] | None = None
     terraform_dir: str | None = None
     openstack_env: dict[str, str] = {}
     clouds_config: PerTaskCloudsConfig | None = None
-
-    tfstate_conn_str = settings.TFSTATE_DATABASE_URL or None
-    tfstate_schema = _tfstate_schema_name(deployment_id)
 
     if teams is None:
         teams = {}
@@ -1785,15 +1651,8 @@ def redeploy_resource(
     def _stream_line(tool: str, line: str) -> None:
         task_logger.tool_output_line(tool, line)
 
-    def collect_terraform_state():
-        return collect_terraform_state_helper(
-            terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger
-        )
-
     def collect_terraform_outputs():
-        return collect_terraform_outputs_helper(
-            terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger
-        )
+        return collect_terraform_outputs_helper(terraform_dir, openstack_env, state_backend, task_logger)
 
     try:
         # Validate the address shape before we do any work. Backend
@@ -1824,11 +1683,11 @@ def redeploy_resource(
         phase_tracker.mark(PHASE_GIT_CLONE, "Cloning repository at original release tag")
         task_logger.info(
             f"Cloning {app_git_link} at {release} (same ref as the original deploy "
-            "so OpenTofu code matches the pg-backend state)",
+            "so OpenTofu code matches the stored state)",
             category=LogCategory.OPERATION,
         )
         try:
-            repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=deployment_id, tag=release)
+            repo_path = _clone_for_job(app_git_link, deployment_id, release)
             try:
                 commit_info = _extract_commit_info(repo_path)
                 task_logger.success(
@@ -1889,8 +1748,7 @@ def redeploy_resource(
         terraform = OpenTofuExecutor(
             terraform_dir,
             env_vars=openstack_env,
-            backend_conn_str=tfstate_conn_str,
-            backend_schema_name=tfstate_schema,
+            state_backend=state_backend,
             output_callback=_stream_line,
         )
 
@@ -1929,7 +1787,6 @@ def redeploy_resource(
         )
 
         phase_tracker.mark(PHASE_CLEANUP, "Pulling final state")
-        tf_state = collect_terraform_state()
         outputs = collect_terraform_outputs()
 
         task_logger.success(
@@ -1941,20 +1798,16 @@ def redeploy_resource(
             "status": "success",
             "deployment_id": deployment_id,
             "logs": task_logger.get_logs_dict(),
-            "tf_state": tf_state,
             "commit_info": commit_info,
             "terraform_outputs": outputs or {},
         }
 
     except Exception as e:
         task_logger.exception(f"Redeploy failed: {str(e)}", exception=e, deployment_id=deployment_id)
-        if not tf_state:
-            tf_state = collect_terraform_state()
         raise Failure(
             message=str(e),
             deployment_id=deployment_id,
             logs_dict=task_logger.get_logs_dict(),
-            tf_state=tf_state,
             commit_info=commit_info,
             terraform_outputs=outputs or {},
         )

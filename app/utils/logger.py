@@ -8,8 +8,8 @@ Three concerns are kept separate here:
   logger so they appear in the worker container's stdout. Rendering lives in
   a dedicated sink so the buffer and the Python logger stay independent.
 * **Event sink** — an optional callable that ships every entry to a
-  downstream consumer. The deploy task wires the Celery event bus here so
-  the backend's listener can stream entries to the browser.
+  downstream consumer. The jobs wire their task event sink here, so every
+  entry lands in ``task_events`` and the backend streams it to the browser.
 
 A single ``StructuredLogger`` orchestrates these. The class is threadsafe:
 ``Popen`` line readers may write from a reader thread while the main task
@@ -260,8 +260,8 @@ class _ConsoleSink:
 EventEmitter = Callable[[str, dict[str, Any]], None]
 """Signature: ``emit(event_name, payload_dict) -> None``.
 
-The deploy task plugs Celery's ``self.send_event`` here so every log entry
-also turns into a ``task-log`` event on the bus. ``None`` disables it.
+The jobs plug their ``TaskEventSink.send_event`` here so every log entry
+also becomes a ``task-log`` event. ``None`` disables it.
 """
 
 
@@ -297,10 +297,10 @@ class StructuredLogger:
     # ----- emitter wiring (settable post-construction) --------------------
 
     def set_event_emitter(self, emitter: EventEmitter | None) -> None:
-        """Attach or detach the Celery-event sink at runtime.
+        """Attach or detach the task event sink at runtime.
 
-        ``tasks.py`` constructs the logger before it can capture ``self`` for
-        ``send_event``, so we need a setter.
+        ``tasks.py`` constructs the logger before it wires up the event
+        sink, so we need a setter.
         """
         self._event_emitter = emitter
 
@@ -311,10 +311,9 @@ class StructuredLogger:
         self._console.write(entry)
         if emit_event and self._event_emitter is not None:
             try:
-                # Celery's EventReceiver injects its own ``timestamp``
-                # field (Unix-time float) and does arithmetic on it, so a
-                # payload carrying an ISO-string ``timestamp`` would crash
-                # it. Re-key ours as ``iso_timestamp``.
+                # The live stream has always shipped the entry's ISO time
+                # as ``iso_timestamp`` (Celery used to reserve
+                # ``timestamp``); the frontend reads that key, so it stays.
                 payload = entry.to_dict()
                 if "timestamp" in payload:
                     payload["iso_timestamp"] = payload.pop("timestamp")
@@ -423,17 +422,15 @@ class StructuredLogger:
         """Send a progress update without buffering a per-step transcript entry.
 
         The buffered transcript shouldn't grow by a progress marker per
-        step; we still emit the Celery custom event so the listener can
-        update the DB and the UI.
+        step; we still emit the ``task-progress`` event so the task row and
+        the UI get the new phase/percent.
 
         ``phase_names`` is the full ordered list of phases for this task.
         When provided, the UI can render every stepper slot with its real
         label immediately. The payload is small and safe to repeat on
-        every event — the listener overwrites its cached copy.
+        every event — the UI overwrites its cached copy.
 
-        Do NOT put a ``timestamp`` field in the payload: Celery injects one
-        itself (as a Unix-time float) and would crash on an ISO string.
-        Pass the ISO time as ``iso_timestamp`` if needed downstream.
+        The time goes out as ``iso_timestamp``, the key the frontend reads.
         """
         pct = max(0, min(100, round((idx / max(total, 1)) * 100)))
         if self._event_emitter is not None:
@@ -447,8 +444,7 @@ class StructuredLogger:
                 "iso_timestamp": _now_iso(),
             }
             if phase_names is not None:
-                # Keep as a plain list — Celery uses JSON serialisation
-                # by default and tuples are coerced anyway.
+                # A plain list: the event is stored as JSON.
                 payload["phase_names"] = list(phase_names)
             with contextlib.suppress(Exception):
                 self._event_emitter(self.PROGRESS_EVENT_NAME, payload)
