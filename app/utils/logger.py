@@ -32,6 +32,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
+from app.i18n import Locale, localize_text, t
+
 # ----------------------------------------------------------------------------
 # Public enums
 # ----------------------------------------------------------------------------
@@ -284,8 +286,14 @@ class StructuredLogger:
         console: bool = True,
         event_emitter: EventEmitter | None = None,
         track_timing: bool = True,
+        locale: Locale = "en",
     ) -> None:
         self.name = name
+        # Language of the self-written texts (messages, phase labels). The
+        # sources stay English; ``"en"`` therefore means "no translation",
+        # which is also what logger instances without a task (module-level
+        # loggers, tests) get. Tasks pass the language of the request.
+        self.locale = locale
         self.correlation_id = correlation_id
         self.track_timing = track_timing
         self._buffer = _Buffer()
@@ -377,22 +385,26 @@ class StructuredLogger:
             **slots,
         )
 
+    def _tr(self, message: Any) -> str:
+        """Self-written message in the logger's language; foreign text is left alone."""
+        return localize_text(str(message), self.locale)
+
     # ----- level shortcuts (kept for backwards compat) --------------------
 
     def debug(self, message: str, category: LogCategory = LogCategory.DEBUG, **context: Any) -> None:
-        self._record(self._build(message, level=LogLevel.DEBUG, category=category, **context))
+        self._record(self._build(self._tr(message), level=LogLevel.DEBUG, category=category, **context))
 
     def info(self, message: str, category: LogCategory = LogCategory.SYSTEM, **context: Any) -> None:
-        self._record(self._build(message, level=LogLevel.INFO, category=category, **context))
+        self._record(self._build(self._tr(message), level=LogLevel.INFO, category=category, **context))
 
     def success(self, message: str, category: LogCategory = LogCategory.STATUS, **context: Any) -> None:
-        self._record(self._build(message, level=LogLevel.SUCCESS, category=category, **context))
+        self._record(self._build(self._tr(message), level=LogLevel.SUCCESS, category=category, **context))
 
     def warning(self, message: str, category: LogCategory = LogCategory.SYSTEM, **context: Any) -> None:
-        self._record(self._build(message, level=LogLevel.WARNING, category=category, **context))
+        self._record(self._build(self._tr(message), level=LogLevel.WARNING, category=category, **context))
 
     def error(self, message: str, category: LogCategory = LogCategory.ERROR, **context: Any) -> None:
-        self._record(self._build(message, level=LogLevel.ERROR, category=category, **context))
+        self._record(self._build(self._tr(message), level=LogLevel.ERROR, category=category, **context))
 
     # ----- structured helpers --------------------------------------------
 
@@ -442,7 +454,7 @@ class StructuredLogger:
                 "phase_index": idx,
                 "total_phases": total,
                 "progress_pct": pct,
-                "message": message,
+                "message": self._tr(message) if message else message,
                 "correlation_id": self.correlation_id,
                 "iso_timestamp": _now_iso(),
             }
@@ -459,7 +471,7 @@ class StructuredLogger:
                 self._operation_stack.append((operation_name, time.time()))
         self._record(
             self._build(
-                f"Starting: {operation_name}",
+                t("log.operation_start", self.locale, operation=operation_name),
                 level=LogLevel.INFO,
                 category=LogCategory.OPERATION,
                 operation=operation_name,
@@ -476,10 +488,10 @@ class StructuredLogger:
                     if last_op == operation_name:
                         self._operation_stack.pop()
                         duration_ms = (time.time() - start_time) * 1000
-        status = "completed" if success else "failed"
+        key = "log.operation_completed" if success else "log.operation_failed"
         self._record(
             self._build(
-                f"{status.capitalize()}: {operation_name}",
+                t(key, self.locale, operation=operation_name),
                 level=LogLevel.INFO,
                 category=LogCategory.OPERATION,
                 operation=operation_name,
@@ -547,7 +559,7 @@ class StructuredLogger:
             ctx["stack_trace"] = tb
         else:
             ctx.setdefault("exception_type", "Unknown")
-        self._record(self._build(message, level=LogLevel.ERROR, category=LogCategory.ERROR, **ctx))
+        self._record(self._build(self._tr(message), level=LogLevel.ERROR, category=LogCategory.ERROR, **ctx))
 
     def resource_info(self, resource_type: str, resource_name: str, **details: Any) -> None:
         self._record(
@@ -606,10 +618,11 @@ class StructuredLogger:
 # ----------------------------------------------------------------------------
 
 
-def get_logger(name: str, *, correlation_id: str | None = None) -> StructuredLogger:
+def get_logger(name: str, *, correlation_id: str | None = None, locale: Locale = "en") -> StructuredLogger:
     """Return a fresh ``StructuredLogger``.
 
     Each deployment task gets its own instance — the per-task buffer is
     state, so we deliberately don't memoise like ``logging.getLogger`` does.
+    ``locale`` is the language of the self-written texts (see ``app/i18n``).
     """
-    return StructuredLogger(name, correlation_id=correlation_id)
+    return StructuredLogger(name, correlation_id=correlation_id, locale=locale)

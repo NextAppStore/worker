@@ -7,6 +7,7 @@ import git
 
 from .celery_app import celery_app
 from .config import settings
+from .i18n import localize_text, task_locale
 from .services import (
     OpenStackService,
     OpenTofuExecutor,
@@ -688,7 +689,8 @@ def deploy_application(
     Returns:
         dict: status, logs, tf_state, commit_info, terraform_outputs
     """
-    task_logger = get_logger(f"deploy:{deployment_id}", correlation_id=deployment_id)
+    locale = task_locale(self)
+    task_logger = get_logger(f"deploy:{deployment_id}", correlation_id=deployment_id, locale=locale)
 
     # Wire the per-deployment logger to Celery's event bus. Every buffered
     # log entry now becomes a ``task-log`` event, and ``task_logger.progress``
@@ -1028,7 +1030,7 @@ def deploy_application(
 
         # Raise custom exception with all details
         raise Failure(
-            message=str(e),
+            message=localize_text(str(e), locale),
             deployment_id=deployment_id,
             logs_dict=task_logger.get_logs_dict(),
             tf_state=tf_state,
@@ -1069,7 +1071,8 @@ def destroy_deployment(
     Args mirror ``deploy_application`` so the backend can re-dispatch
     the same persisted values without translation.
     """
-    task_logger = get_logger(f"destroy:{deployment_id}", correlation_id=deployment_id)
+    locale = task_locale(self)
+    task_logger = get_logger(f"destroy:{deployment_id}", correlation_id=deployment_id, locale=locale)
 
     bound_task = self
 
@@ -1252,7 +1255,7 @@ def destroy_deployment(
         if not tf_state:
             tf_state = collect_terraform_state()
         raise Failure(
-            message=str(e),
+            message=localize_text(str(e), locale),
             deployment_id=deployment_id,
             logs_dict=task_logger.get_logs_dict(),
             tf_state=tf_state,
@@ -1337,7 +1340,8 @@ def _run_compute_lifecycle(
     failed" without any pointer to which instance is stuck.
     """
     label = f"{action}:{deployment_id}"
-    task_logger = get_logger(label, correlation_id=deployment_id)
+    locale = task_locale(self)
+    task_logger = get_logger(label, correlation_id=deployment_id, locale=locale)
 
     bound_task = self
 
@@ -1469,7 +1473,7 @@ def _run_compute_lifecycle(
                     category=LogCategory.ERROR,
                     server_id=sid,
                 )
-                failures.append((sid, err or "unknown error"))
+                failures.append((sid, localize_text(err or "unknown error", locale)))
 
         if failures:
             joined = "; ".join(f"{sid}: {err}" for sid, err in failures)
@@ -1508,7 +1512,7 @@ def _run_compute_lifecycle(
     except Exception as e:
         task_logger.exception(f"{action} failed: {str(e)}", exception=e, deployment_id=deployment_id)
         raise Failure(
-            message=str(e),
+            message=localize_text(str(e), locale),
             deployment_id=deployment_id,
             logs_dict=task_logger.get_logs_dict(),
             tf_state=None,
@@ -1758,7 +1762,8 @@ def redeploy_resource(
     Returns the same payload shape as deploy/destroy so the celery
     event listener stays generic.
     """
-    task_logger = get_logger(f"redeploy:{deployment_id}", correlation_id=deployment_id)
+    locale = task_locale(self)
+    task_logger = get_logger(f"redeploy:{deployment_id}", correlation_id=deployment_id, locale=locale)
 
     bound_task = self
 
@@ -1951,7 +1956,7 @@ def redeploy_resource(
         if not tf_state:
             tf_state = collect_terraform_state()
         raise Failure(
-            message=str(e),
+            message=localize_text(str(e), locale),
             deployment_id=deployment_id,
             logs_dict=task_logger.get_logs_dict(),
             tf_state=tf_state,
