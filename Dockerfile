@@ -103,10 +103,14 @@ ENV PATH="/app/.venv/bin:$PATH" \
 # local-exec) ist nicht vertrauenswürdig; diese Trennung hält ihn von
 # DATABASE_URL, dem Fernet-Key und dem Nachbar-Job fern.
 #
-# Kein HEALTHCHECK: Der Prozess wartet blockierend auf LISTEN task_queued.
-# Stirbt er, startet Docker ihn neu (restart: unless-stopped); hängt ein Job,
-# läuft seine Lease ab und das Backend beendet den Task.
-#
+# HEALTHCHECK: Der Worker berührt WORKER_HEALTH_FILE alle 30 s, solange
+# alle Slots laufen und die Datenbank antwortet (app/runner.py). Ist die
+# Datei älter als 90 s, ist der Container unhealthy. Lange Applies stören
+# nicht, die Prüfung läuft in einem eigenen Thread. Ein hängender Job wird
+# davon unabhängig über seine Lease vom Backend beendet.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["python", "-c", "import os, sys, time; sys.exit(time.time() - os.path.getmtime(os.environ.get('WORKER_HEALTH_FILE', '/tmp/appstore-worker.healthy')) > 90)"]
+
 # Bei SIGTERM nimmt er keine neuen Jobs an und lässt laufende fertig
 # laufen; die Compose-Dateien geben ihm dafür eine lange stop_grace_period.
 CMD ["python", "-m", "app"]

@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     WORKER_JOB_UID_BASE: int | None = None
     # Per-slot home directories of those users (plugin caches).
     WORKER_JOB_HOME_BASE: str = "/var/lib/appstore-worker"
+    # Liveness for Docker's HEALTHCHECK: every WORKER_HEALTH_INTERVAL_SECONDS
+    # the worker touches this file, as long as all its slots run and the
+    # database answers. The image's HEALTHCHECK fails when it gets stale.
+    WORKER_HEALTH_FILE: str = "/tmp/appstore-worker.healthy"
+    WORKER_HEALTH_INTERVAL_SECONDS: int = 30
 
     # The backend API as the worker's jobs reach it on the container
     # network; OpenTofu keeps each deployment's state there

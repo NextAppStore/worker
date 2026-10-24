@@ -8,6 +8,7 @@ up because of the NOTIFY — there is no polling interval to fall back on.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -180,3 +181,87 @@ def test_worker_start_reports_undelivered_rescued_states(mocker, caplog):
     with caplog.at_level("WARNING", logger="app.runner"):
         assert runner.report_rescued_states() == ["/r/dep-1_task-1_t.tfstate.enc"]
     assert "make prod-restore-tfstate DEPLOYMENT=dep-1 FILE=/r/dep-1_task-1_t.tfstate.enc" in caplog.text
+
+
+# ----------------------------------------------------------------
+# health check (Docker HEALTHCHECK reads the file's age)
+# ----------------------------------------------------------------
+UNREACHABLE_DB = "postgresql://nobody@127.0.0.1:1/none"
+
+
+def _alive_thread(stop_running: threading.Event) -> threading.Thread:
+    thread = threading.Thread(target=stop_running.wait, daemon=True)
+    thread.start()
+    return thread
+
+
+@pytest.mark.unit
+def test_health_fails_when_a_slot_has_died():
+    dead = threading.Thread(target=lambda: None)
+    dead.start()
+    dead.join()
+    # Returns before touching the database (the URL would not connect anyway).
+    assert runner.check_health([dead], threading.Event(), UNREACHABLE_DB) is False
+
+
+@pytest.mark.unit
+def test_health_fails_when_the_database_is_unreachable():
+    release = threading.Event()
+    try:
+        assert runner.check_health([_alive_thread(release)], threading.Event(), UNREACHABLE_DB) is False
+    finally:
+        release.set()
+
+
+@pytest.mark.integration
+def test_health_passes_with_running_slots_and_a_database(queue_db_url):
+    release = threading.Event()
+    try:
+        assert runner.check_health([_alive_thread(release)], threading.Event(), queue_db_url) is True
+    finally:
+        release.set()
+
+
+@pytest.mark.integration
+def test_idle_slots_that_exited_for_shutdown_do_not_count(queue_db_url):
+    exited = threading.Thread(target=lambda: None)
+    exited.start()
+    exited.join()
+    stop = threading.Event()
+    stop.set()
+    assert runner.check_health([exited], stop, queue_db_url) is True
+
+
+@pytest.mark.unit
+def test_mark_healthy_creates_and_refreshes_the_file(tmp_path):
+    path = tmp_path / "healthy"
+    runner.mark_healthy(str(path))
+    old = time.time() - 300
+    os.utime(path, (old, old))
+    runner.mark_healthy(str(path))
+    assert time.time() - path.stat().st_mtime < 5
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("healthy", [True, False])
+def test_report_health_touches_the_file_only_while_healthy(tmp_path, monkeypatch, healthy):
+    path = tmp_path / "healthy"
+    monkeypatch.setattr(runner.settings, "WORKER_HEALTH_FILE", str(path))
+    monkeypatch.setattr(runner.settings, "WORKER_HEALTH_INTERVAL_SECONDS", 0.01)
+    checks = []
+
+    def fake_check(threads, stop, conninfo):
+        checks.append(1)
+        return healthy
+
+    monkeypatch.setattr(runner, "check_health", fake_check)
+    done = threading.Event()
+    thread = threading.Thread(target=runner.report_health, args=([], threading.Event(), done, "x"))
+    thread.start()
+    deadline = time.monotonic() + 5
+    while len(checks) < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    done.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive() and len(checks) >= 3
+    assert path.exists() is healthy

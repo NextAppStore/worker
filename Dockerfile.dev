@@ -51,5 +51,10 @@ RUN mkdir -p /tmp/worker_repos
 RUN mkdir -p /var/lib/appstore-worker && chmod 0711 /tmp/worker_repos /var/lib/appstore-worker
 ENV WORKER_JOB_UID_BASE=20000
 
+# Wie in Prod: unhealthy, wenn der Worker seine Health-Datei 90 s nicht
+# berührt hat (Slot tot oder Datenbank weg, siehe app/runner.py).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["python3", "-c", "import os, sys, time; sys.exit(time.time() - os.path.getmtime(os.environ.get('WORKER_HEALTH_FILE', '/tmp/appstore-worker.healthy')) > 90)"]
+
 # Worker starten: LISTEN task_queued, Jobs aus der Postgres-Queue
 CMD ["poetry", "run", "python", "-m", "app"]

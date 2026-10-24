@@ -189,6 +189,51 @@ def report_rescued_states() -> list[str]:
     return pending
 
 
+def check_health(threads: list[threading.Thread], stop: threading.Event, conninfo: str) -> bool:
+    """Whether the worker is fit: every slot still runs and the database answers.
+
+    During shutdown idle slots exit on purpose, so only the database counts.
+    """
+    if not stop.is_set() and not all(t.is_alive() for t in threads):
+        logger.error("health check: a worker slot has died")
+        return False
+    try:
+        with psycopg.connect(conninfo, connect_timeout=5) as conn:
+            conn.execute("SELECT 1")
+    except Exception as e:
+        logger.warning("health check: database not reachable (%s)", e)
+        return False
+    return True
+
+
+def mark_healthy(path: str) -> None:
+    """Touch ``path``; the image's HEALTHCHECK fails once it is older than three intervals.
+
+    Never deleted when unhealthy, only left to go stale: a job's tools run
+    as another user and cannot touch a file the worker (root) owns.
+    """
+    with open(path, "a"):
+        pass
+    os.utime(path)
+
+
+def report_health(threads: list[threading.Thread], stop: threading.Event, done: threading.Event, conninfo: str) -> None:
+    """Check health every ``WORKER_HEALTH_INTERVAL_SECONDS`` until ``done``.
+
+    Runs beside the slots, so a long apply in every slot does not make the
+    worker look dead; during a graceful shutdown it keeps reporting until
+    the running jobs have finished.
+    """
+    while True:
+        if check_health(threads, stop, conninfo):
+            try:
+                mark_healthy(settings.WORKER_HEALTH_FILE)
+            except OSError:
+                logger.warning("health check: cannot write %s", settings.WORKER_HEALTH_FILE, exc_info=True)
+        if done.wait(settings.WORKER_HEALTH_INTERVAL_SECONDS):
+            return
+
+
 def main() -> None:
     """Start the slots, install the SIGTERM/SIGINT handlers and wait for shutdown."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -224,6 +269,11 @@ def main() -> None:
     logger.info("worker %s listening on %s with %d slots", worker_id, CHANNEL_TASK_QUEUED, len(threads))
     for t in threads:
         t.start()
+    done = threading.Event()
+    threading.Thread(
+        target=report_health, args=(threads, stop, done, conninfo), name="worker-health", daemon=True
+    ).start()
     for t in threads:
         t.join()
+    done.set()
     logger.info("worker %s stopped", worker_id)
