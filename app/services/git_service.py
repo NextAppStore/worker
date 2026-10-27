@@ -85,6 +85,10 @@ class GitService:
 
             # Clone with --branch <tag> --depth 1 (no history, only the tag)
             repo = git.Repo.clone_from(auth_url, str(repo_path), branch=tag, depth=1, single_branch=True)
+            # The clone stored the token-bearing URL in .git/config. The
+            # app's own code (OpenTofu local-exec, Packer provisioners) runs
+            # in this directory, so put the plain URL back.
+            repo.remotes.origin.set_url(git_url)
 
             logger.info(f"✓ Repository cloned successfully to {repo_path}")
             logger.info(f"Current HEAD: {repo.head.commit.hexsha}")

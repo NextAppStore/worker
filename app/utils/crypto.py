@@ -1,8 +1,8 @@
 """Symmetric encryption mirror for the worker.
 
 Identical surface to `backend/app/utils/crypto.py` so behaviour cannot drift.
-The shared `CREDENTIAL_ENCRYPTION_KEY` lets the worker decrypt envelopes the
-backend pushed onto the Celery queue without ever touching the database.
+The shared `CREDENTIAL_ENCRYPTION_KEY` lets the worker open the job payload
+the backend sealed on the task row, and the credential envelope inside it.
 """
 
 from __future__ import annotations

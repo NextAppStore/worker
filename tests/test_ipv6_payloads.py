@@ -5,11 +5,17 @@ import shutil
 from unittest.mock import MagicMock
 
 import pytest
-from kombu.serialization import dumps, loads
 
+from app import job_queue
 from app.services.opentofu_executor import OpenTofuExecutor
 from app.services.packer_executor import PackerExecutor
 from app.tasks import Failure, encode_packer_vars, encode_terraform_vars
+from app.utils.crypto import decrypt, encrypt
+
+
+def _through_job_payload(values):
+    """What the backend seals on the task row and the worker opens (JSON + Fernet)."""
+    return json.loads(decrypt(encrypt(json.dumps(values))))
 
 
 @pytest.fixture(
@@ -23,9 +29,8 @@ def network_values(request):
 
 
 def test_task_variables_reach_tool_arguments(mocker, tmp_path, network_values):
-    """Capture actual executor argv after Celery serialization and task encoding."""
-    content_type, encoding, body = dumps(network_values, serializer="json")
-    received = loads(body, content_type, encoding)
+    """Capture actual executor argv after the job payload round-trip and task encoding."""
+    received = _through_job_payload(network_values)
     tf = OpenTofuExecutor(str(tmp_path))
     stream = mocker.patch.object(tf, "_run_streamed", return_value=(True, "", ""))
     assert tf.plan(variables=encode_terraform_vars(received))[0]
@@ -40,7 +45,7 @@ def test_task_variables_reach_tool_arguments(mocker, tmp_path, network_values):
         assert json.loads(pairs["ips"]) == network_values["ips"]
 
 
-def test_terraform_outputs_survive_success_and_failure_messages(mocker, tmp_path, network_values):
+def test_terraform_outputs_survive_success_and_failure_results(mocker, tmp_path, network_values):
     outputs = {"team_vms": {"value": {"Team-1": network_values}}}
     mocker.patch(
         "app.services.opentofu_executor.subprocess.run",
@@ -51,10 +56,10 @@ def test_terraform_outputs_survive_success_and_failure_messages(mocker, tmp_path
         ),
     )
     result = OpenTofuExecutor(str(tmp_path)).output()
-    content_type, encoding, body = dumps({"terraform_outputs": result}, serializer="json")
-    assert loads(body, content_type, encoding)["terraform_outputs"] == outputs
+    # What lands in tasks.outputs on success and on failure.
+    assert json.loads(job_queue.success_columns({"terraform_outputs": result})["outputs"]) == outputs
     failure = Failure("test", "dep", [], terraform_outputs=result)
-    assert json.loads(str(failure))["terraform_outputs"] == outputs
+    assert json.loads(job_queue.failure_columns(failure)["outputs"]) == outputs
 
 
 @pytest.mark.integration

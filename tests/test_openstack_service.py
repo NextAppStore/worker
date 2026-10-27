@@ -61,11 +61,16 @@ class TestRun:
         assert kwargs["text"] is True
         assert kwargs["timeout"] == 30
 
-    def test_run_merges_env_vars_on_top_of_os_environ(self, service, mocker):
-        """_run merges self.env_vars on top of os.environ in the env kwarg."""
+    def test_run_passes_only_the_job_environment(self, service, mocker):
+        """_run builds the env from scratch: PATH plus the job's OS_* values, nothing of the worker."""
         mocker.patch.dict(
-            "app.services.openstack_service.os.environ",
-            {"PATH": "/usr/bin", "OS_AUTH_URL": "should-be-overridden"},
+            "os.environ",
+            {
+                "PATH": "/usr/bin",
+                "OS_AUTH_URL": "should-be-overridden",
+                "DATABASE_URL": "postgresql://appstore_worker:pw@postgres/app",
+                "CREDENTIAL_ENCRYPTION_KEY": "fernet-key",
+            },
             clear=True,
         )
         mock_sp = mocker.patch(
@@ -74,8 +79,10 @@ class TestRun:
         )
         service._run(["openstack", "image", "list"])
         env_passed = mock_sp.call_args.kwargs["env"]
-        # os.environ values present
+        # PATH so the CLI is found; the worker's secrets are not passed on.
         assert env_passed["PATH"] == "/usr/bin"
+        assert "DATABASE_URL" not in env_passed
+        assert "CREDENTIAL_ENCRYPTION_KEY" not in env_passed
         # env_vars override and add OS_* values
         assert env_passed["OS_AUTH_URL"] == "https://keystone.example.com:5000/v3"
         assert env_passed["OS_USERNAME"] == "test-user"

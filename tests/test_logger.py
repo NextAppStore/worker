@@ -375,7 +375,7 @@ class TestStructuredLoggerProgress:
         assert payload["progress_pct"] == 50
         assert payload["message"] == "halfway"
         assert payload["phase"] == "phase1"
-        assert "timestamp" not in payload  # would crash Celery
+        assert "timestamp" not in payload  # the frontend reads iso_timestamp
         assert "iso_timestamp" in payload
 
     def test_progress_clamps_over_100(self):

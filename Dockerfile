@@ -10,7 +10,7 @@
 # -----------------------------------------------------------------------------
 # Stage 1: Builder - Poetry installiert Dependencies
 # -----------------------------------------------------------------------------
-FROM python:3.11-slim AS builder
+FROM python:3.12-slim AS builder
 
 WORKDIR /app
 
@@ -28,7 +28,7 @@ RUN poetry install --no-root --only=main --no-ansi
 # -----------------------------------------------------------------------------
 # Stage 2: Runtime - Schlankes Production Image
 # -----------------------------------------------------------------------------
-FROM python:3.11-slim AS runtime
+FROM python:3.12-slim AS runtime
 
 # Build arguments für Multi-Platform Support
 ARG TARGETARCH
@@ -38,7 +38,7 @@ ARG PACKER_VERSION=1.15.3
 WORKDIR /app
 
 # System Dependencies. ``apt-get upgrade`` runs first so the base
-# ``python:3.11-slim`` tag picks up Debian-security backports released
+# ``python:3.12-slim`` tag picks up Debian-security backports released
 # after the upstream image was last rebuilt — that's where things like
 # CVE-2026-45447 (openssl 3.5.6-1~deb13u2) come from. Trivy blocks the
 # push on any HIGH/CRITICAL OS finding, so even though it enlarges the
@@ -54,7 +54,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     && rm -rf /var/lib/apt/lists/*
 
 # Upgrade base-image Python tooling (pip / setuptools / wheel) to pull
-# in security fixes that the upstream `python:3.11-slim` tag hasn't
+# in security fixes that the upstream `python:3.12-slim` tag hasn't
 # picked up yet. Trivy scans these system site-packages — anything
 # HIGH/CRITICAL here blocks the push.
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
@@ -86,17 +86,31 @@ COPY --from=builder /app/.venv /app/.venv
 # Application Code kopieren
 COPY app/ ./app/
 
-# Arbeitsverzeichnis für Worker
-RUN mkdir -p /tmp/worker_repos
+# Job-Verzeichnisse (je Deployment, dem Slot-User übergeben) und die Homes
+# der Slot-User: für die Slot-User betretbar, aber nicht auflistbar.
+RUN mkdir -p /tmp/worker_repos /var/lib/appstore-worker && \
+    chmod 0711 /tmp/worker_repos /var/lib/appstore-worker
 
 # Environment für .venv
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    WORKER_JOB_UID_BASE=20000
 
-# Health check (optional - prüft ob Celery läuft)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD celery -A app.celery_app inspect ping -d celery@$HOSTNAME || exit 1
+# Der Worker läuft als root (.trivyignore AVD-DS-0002) aus genau einem Grund:
+# Er startet die Tools jedes Jobs als eigenen unprivilegierten User
+# (UID 20000 + Slot, siehe app/job_context.py). App-Code (OpenTofu
+# local-exec) ist nicht vertrauenswürdig; diese Trennung hält ihn von
+# DATABASE_URL, dem Fernet-Key und dem Nachbar-Job fern.
+#
+# HEALTHCHECK: Der Worker berührt WORKER_HEALTH_FILE alle 30 s, solange
+# alle Slots laufen und die Datenbank antwortet (app/runner.py). Ist die
+# Datei älter als 90 s, ist der Container unhealthy. Lange Applies stören
+# nicht, die Prüfung läuft in einem eigenen Thread. Ein hängender Job wird
+# davon unabhängig über seine Lease vom Backend beendet.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["python", "-c", "import os, sys, time; sys.exit(time.time() - os.path.getmtime(os.environ.get('WORKER_HEALTH_FILE', '/tmp/appstore-worker.healthy')) > 90)"]
 
-# Celery Worker starten
-CMD ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--autoscale=2,20", "-E", "--prefetch-multiplier=1"]
+# Bei SIGTERM nimmt er keine neuen Jobs an und lässt laufende fertig
+# laufen; die Compose-Dateien geben ihm dafür eine lange stop_grace_period.
+CMD ["python", "-m", "app"]

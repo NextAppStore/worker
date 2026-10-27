@@ -1,9 +1,8 @@
 """Sprache eines Tasks.
 
-Das Backend schickt die UI-Sprache der Nutzer*in als Celery-Message-Header
-``locale`` (``"de"`` oder ``"en"``) mit. Es ist bewusst kein Argument: die
-Task-Signaturen bleiben unverändert, und ältere Backends, die den Header noch
-nicht senden, funktionieren weiter.
+Das Backend schickt die UI-Sprache der Nutzer*in als ``locale``-Feld im
+Task-Payload mit (``"de"`` oder ``"en"``). Ältere Backends, die das Feld noch
+nicht senden, bekommen den Standard (``DEFAULT_LOCALE``).
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ Locale = Literal["de", "en"]
 
 SUPPORTED_LOCALES: tuple[Locale, ...] = ("de", "en")
 
-# Gleicher Fallback wie im Backend und im Frontend: Fehlt der Header oder ist
+# Gleicher Fallback wie im Backend und im Frontend: Fehlt das Feld oder ist
 # die Sprache unbekannt, wird Deutsch ausgegeben.
 DEFAULT_LOCALE: Locale = "de"
 
@@ -26,19 +25,3 @@ def normalize_locale(value: Any) -> Locale:
         if primary in SUPPORTED_LOCALES:
             return primary  # type: ignore[return-value]
     return DEFAULT_LOCALE
-
-
-def task_locale(task: Any) -> Locale:
-    """Sprache aus dem Header ``locale`` der Celery-Nachricht des laufenden Tasks.
-
-    Für ``bind=True``-Tasks: ``task_locale(self)``. Außerhalb eines echten
-    Aufrufs (``task.run(...)`` in Tests) gibt es keinen Header → Standard.
-    """
-    request = getattr(task, "request", None)
-    getter = getattr(request, "get", None)
-    if not callable(getter):
-        return DEFAULT_LOCALE
-    try:
-        return normalize_locale(getter("locale"))
-    except Exception:  # pragma: no cover - defensiv, ein Log-Detail darf nie einen Task brechen
-        return DEFAULT_LOCALE

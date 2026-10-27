@@ -5,17 +5,16 @@ import itertools
 import json
 import os
 import pathlib
-from contextlib import contextmanager
-from types import SimpleNamespace
 
 import pytest
 
-from app.i18n import localize_text, normalize_locale, t, task_locale
+from app.i18n import localize_text, normalize_locale, t
 from app.i18n.catalog import MESSAGES
 from app.i18n.translate import find_key, placeholders
 from app.tasks import Failure, deploy_application, pause_deployment
 from app.utils.logger import LogCategory, StructuredLogger
 from tests.test_tasks_branches import (
+    _Events,
     _FakeTemplate,
     _make_build_lock_mock,
     _make_clouds_config_mock,
@@ -25,14 +24,13 @@ from tests.test_tasks_branches import (
     _make_tofu_executor_mock,
     _patch_git_repo,
     _seed_terraform_dir,
-    _silence_events,
 )
 
 APP_DIR = pathlib.Path(__file__).resolve().parents[1] / "app"
 
 
 # ---------------------------------------------------------------------------
-# Sprache aus dem Celery-Header
+# Sprache aus dem Task-Payload
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "value, expected",
@@ -50,22 +48,6 @@ APP_DIR = pathlib.Path(__file__).resolve().parents[1] / "app"
 )
 def test_normalize_locale(value, expected):
     assert normalize_locale(value) == expected
-
-
-def _task_with_header(**headers):
-    return SimpleNamespace(request=SimpleNamespace(get=lambda key, default=None: headers.get(key, default)))
-
-
-def test_task_locale_reads_the_celery_header():
-    assert task_locale(_task_with_header(locale="en")) == "en"
-    assert task_locale(_task_with_header(locale="de")) == "de"
-
-
-def test_task_locale_falls_back_to_german_without_header():
-    """Ältere Backends senden den Header nicht."""
-    assert task_locale(_task_with_header()) == "de"
-    assert task_locale(SimpleNamespace()) == "de"
-    assert task_locale(SimpleNamespace(request=None)) == "de"
 
 
 # ---------------------------------------------------------------------------
@@ -101,8 +83,8 @@ def test_known_text_is_translated_and_english_is_untouched():
 
 
 def test_parameters_are_extracted():
-    assert localize_text("Could not pull OpenTofu state: connection refused", "de") == (
-        "OpenTofu-State konnte nicht abgerufen werden: connection refused"
+    assert localize_text("Could not read OpenTofu outputs: connection refused", "de") == (
+        "OpenTofu-Ausgaben konnten nicht gelesen werden: connection refused"
     )
 
 
@@ -260,11 +242,11 @@ def _messages(logger):
 def test_logger_translates_its_own_texts_in_german():
     logger = StructuredLogger("t", console=False, locale="de")
     logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
-    logger.warning("Could not read OpenTofu state: boom")
+    logger.warning("Could not read OpenTofu outputs: boom")
     logger.error("OpenTofu plan failed")
     assert _messages(logger) == [
         "Repository aufgeräumt",
-        "OpenTofu-State konnte nicht gelesen werden: boom",
+        "OpenTofu-Ausgaben konnten nicht gelesen werden: boom",
         "OpenTofu-Plan fehlgeschlagen",
     ]
 
@@ -320,20 +302,10 @@ def test_progress_message_is_translated_but_phase_name_is_not():
 # ---------------------------------------------------------------------------
 # Task-Anbindung (Header -> Logger und Failure)
 # ---------------------------------------------------------------------------
-@contextmanager
-def _celery_headers(task, **headers):
-    task.push_request(**headers)
-    try:
-        yield
-    finally:
-        task.pop_request()
-
-
-def _failing_deploy(mocker, tmp_path, **headers):
+def _failing_deploy(mocker, tmp_path, locale=None):
     repo_path = str(tmp_path / "repo")
     os.makedirs(repo_path)
     _seed_terraform_dir(repo_path)
-    _silence_events(mocker, deploy_application)
     _make_git_mock(mocker, repo_path)
     _patch_git_repo(mocker)
     _make_clouds_config_mock(mocker)
@@ -342,8 +314,9 @@ def _failing_deploy(mocker, tmp_path, **headers):
     _make_build_lock_mock(mocker, held=True)
     _make_packer_mock(mocker, build=False)
     _make_tofu_executor_mock(mocker)
-    with _celery_headers(deploy_application, **headers), pytest.raises(Failure) as excinfo:
-        deploy_application.run(
+    with pytest.raises(Failure) as excinfo:
+        deploy_application(
+            _Events(),
             deployment_id="dep-1",
             app_id="myapp",
             app_git_link="https://git/repo.git",
@@ -351,24 +324,25 @@ def _failing_deploy(mocker, tmp_path, **headers):
             user_vars={"terraform": {}},
             teams=None,
             openstack_envelope={"project_id": "p1"},
+            locale=locale,
         )
-    return json.loads(excinfo.value.args[0])
+    return excinfo.value.to_dict()
 
 
 @pytest.mark.parametrize(
-    "headers, error_prefix, log_text",
+    "locale, error_prefix, log_text",
     [
-        ({"locale": "en"}, "Packer error: Packer build failed", "Cloning repository: https://git/repo.git"),
+        ("en", "Packer error: Packer build failed", "Cloning repository: https://git/repo.git"),
         (
-            {"locale": "de"},
+            "de",
             "Packer-Fehler: Packer-Build fehlgeschlagen",
             "Repository wird geklont: https://git/repo.git",
         ),
-        ({}, "Packer-Fehler: Packer-Build fehlgeschlagen", "Repository wird geklont: https://git/repo.git"),
+        (None, "Packer-Fehler: Packer-Build fehlgeschlagen", "Repository wird geklont: https://git/repo.git"),
     ],
 )
-def test_failure_message_and_logs_follow_the_header(mocker, tmp_path, headers, error_prefix, log_text):
-    payload = _failing_deploy(mocker, tmp_path, **headers)
+def test_failure_message_and_logs_follow_the_locale(mocker, tmp_path, locale, error_prefix, log_text):
+    payload = _failing_deploy(mocker, tmp_path, locale=locale)
     assert payload["error"].startswith(error_prefix)
     assert log_text in [entry["message"] for entry in payload["logs"]]
 
@@ -389,12 +363,11 @@ def test_failure_payload_structure_is_independent_of_the_language(mocker, tmp_pa
         )
 
 
-def _failing_pause(mocker, tmp_path, **headers):
+def _failing_pause(mocker, tmp_path, locale=None):
     """Pause, bei der ein Server mit einem selbst formulierten Service-Fehler ausfällt."""
     repo_path = str(tmp_path / "repo")
     os.makedirs(repo_path)
     _seed_terraform_dir(repo_path)
-    _silence_events(mocker, pause_deployment)
     _make_git_mock(mocker, repo_path)
     _make_clouds_config_mock(mocker)
     state = json.dumps(
@@ -413,8 +386,9 @@ def _failing_pause(mocker, tmp_path, **headers):
     # Derselbe Text, den ``OpenStackService.server_stop`` bei leerem stderr liefert.
     os_inst.server_stop.side_effect = [(True, None), (False, "openstack server stop failed")]
     mocker.patch("app.tasks.OpenStackService", return_value=os_inst)
-    with _celery_headers(pause_deployment, **headers), pytest.raises(Failure) as excinfo:
-        pause_deployment.run(
+    with pytest.raises(Failure) as excinfo:
+        pause_deployment(
+            _Events(),
             deployment_id="dep-1",
             app_id="myapp",
             app_git_link="https://git/repo.git",
@@ -422,8 +396,9 @@ def _failing_pause(mocker, tmp_path, **headers):
             user_vars={},
             teams=None,
             openstack_envelope={"project_id": "p1"},
+            locale=locale,
         )
-    return json.loads(excinfo.value.args[0])
+    return excinfo.value.to_dict()
 
 
 def test_pause_failure_is_german_including_the_service_error(mocker, tmp_path):
