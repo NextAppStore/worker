@@ -135,14 +135,6 @@ MESSAGES: dict[str, Message] = {
         "en": "Could not read OpenTofu outputs: {error}",
         "de": "OpenTofu-Ausgaben konnten nicht gelesen werden: {error}",
     },
-    "log.state_pull_failed": {
-        "en": "Could not pull OpenTofu state: {error}",
-        "de": "OpenTofu-State konnte nicht abgerufen werden: {error}",
-    },
-    "log.state_read_failed": {
-        "en": "Could not read OpenTofu state: {error}",
-        "de": "OpenTofu-State konnte nicht gelesen werden: {error}",
-    },
     "log.image_exists": {
         "en": "{log_prefix}Image '{image_name}' already exists (ID: {image_id}). Skipping Packer build.",
         "de": "{log_prefix}Image '{image_name}' existiert bereits (ID: {image_id}). Packer-Build wird übersprungen.",
