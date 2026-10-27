@@ -537,6 +537,57 @@ class TestDeployApplication:
         assert tf_inst.destroy.called  # cleanup-after-failure
         assert tf_inst.apply.called
 
+    def _run_with_readiness(self, mocker, tmp_path, console):
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        _seed_terraform_dir(repo_path)
+
+        _silence_events(mocker, deploy_application)
+        _make_git_mock(mocker, repo_path)
+        _patch_git_repo(mocker)
+        _make_clouds_config_mock(mocker)
+        mocker.patch("app.tasks._discover_packer_templates", return_value=[])
+        _, os_inst = _make_openstack_service_mock(mocker)
+        os_inst.console_log.return_value = console
+        _make_build_lock_mock(mocker)
+        _make_packer_mock(mocker)
+        output = {
+            "readiness_checks": {
+                "value": [{"instance_id": "vm-1", "name": "kurs", "timeout_seconds": 60}],
+            }
+        }
+        _, tf_inst = _make_tofu_executor_mock(mocker, output=output)
+
+        def run():
+            return deploy_application.run(
+                deployment_id="dep-r",
+                app_id="myapp",
+                app_git_link="https://git/repo.git",
+                release="v1",
+                user_vars={"terraform": {}},
+                teams=None,
+                openstack_envelope={"project_id": "p1"},
+            )
+
+        return run, tf_inst, os_inst
+
+    def test_readiness_ready_marker_succeeds(self, mocker, tmp_path):
+        """An ``APPSTORE-READY`` line on the console lets the deploy succeed."""
+        run, tf_inst, os_inst = self._run_with_readiness(mocker, tmp_path, "boot\nAPPSTORE-READY\n")
+        assert run()["status"] == "success"
+        os_inst.console_log.assert_called_with("vm-1")
+        tf_inst.destroy.assert_not_called()
+
+    def test_readiness_failed_marker_fails_and_cleans_up(self, mocker, tmp_path):
+        """``APPSTORE-FAILED`` fails the deploy with the reason and runs cleanup destroy."""
+        run, tf_inst, _ = self._run_with_readiness(
+            mocker, tmp_path, "APPSTORE-FAILED: not ready: student-anna: Pending\n"
+        )
+        with pytest.raises(Failure) as exc:
+            run()
+        assert "kurs: not ready: student-anna: Pending" in str(exc.value)
+        assert tf_inst.destroy.called
+
     def test_missing_envelope_raises_failure(self, mocker, tmp_path):
         """No ``openstack_envelope`` short-circuits with a Failure exception."""
         _silence_events(mocker, deploy_application)

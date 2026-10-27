@@ -128,6 +128,25 @@ class OpenStackService:
         except json.JSONDecodeError:
             return None
 
+    def console_log(self, server_id: str, lines: int = 500) -> str | None:
+        """Return the last ``lines`` lines of the instance's serial console.
+
+        Used by the post-apply readiness check (see
+        :mod:`app.services.readiness`): apps write a status marker to
+        the serial console, which Nova exposes without any network path
+        to the VM. Returns ``None`` if the log can't be fetched (instance
+        still building, console not available, transient API failure);
+        callers treat that as "not ready yet" and poll again.
+        """
+        rc, stdout, stderr = self._run(
+            ["openstack", "console", "log", "show", "--lines", str(lines), server_id],
+            timeout=30,
+        )
+        if rc != 0:
+            logger.debug(f"console log show failed for {server_id}: {stderr.strip()}")
+            return None
+        return stdout
+
     def server_stop(self, server_id: str) -> tuple[bool, str | None]:
         """Stop an OpenStack compute instance.
 

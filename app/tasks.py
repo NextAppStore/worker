@@ -17,6 +17,7 @@ from .services import (
     git_service,
 )
 from .services.packer_discovery import PackerTemplateDiscoveryError, _discover_packer_templates, _PackerTemplate
+from .services.readiness import parse_readiness_checks, wait_for_readiness
 from .utils.logger import LogCategory, get_logger
 
 logger = get_logger(__name__)
@@ -454,6 +455,21 @@ def collect_terraform_outputs_helper(terraform_dir, openstack_env, tfstate_conn_
         except Exception as e:
             task_logger.warning(f"Could not read OpenTofu outputs: {e}", category=LogCategory.WARNING)
     return None
+
+
+def _run_readiness_checks(outputs, openstack_env, task_logger, *, skip_instance_ids=frozenset()) -> None:
+    """Wait for the app's ``readiness_checks`` output, if it declares one.
+
+    Raises with one reason per instance when any instance reports
+    ``APPSTORE-FAILED`` or times out. ``skip_instance_ids`` leaves out
+    instances that already passed on an earlier run (redeploy).
+    """
+    checks = [c for c in parse_readiness_checks(outputs) if c.instance_id not in skip_instance_ids]
+    if not checks:
+        return
+    errors = wait_for_readiness(checks, OpenStackService(env_vars=openstack_env), task_logger)
+    if errors:
+        raise Exception(f"App did not become ready: {'; '.join(errors)}")
 
 
 def _extract_commit_info(repo_path: str) -> dict[str, Any]:
@@ -955,6 +971,11 @@ def deploy_application(
                 task_logger.info(
                     "OpenTofu deployment outputs collected", category=LogCategory.OPERATION, output_count=len(outputs)
                 )
+
+            # Still inside the try: a FAILED marker or a timeout takes the
+            # same cleanup path as a failed apply, so students never get
+            # access mails for an app that did not come up.
+            _run_readiness_checks(outputs, openstack_env, task_logger)
 
         except Exception as e:
             # Try to collect partial results even on failure
@@ -1909,6 +1930,10 @@ def redeploy_resource(
             raise Exception("OpenTofu init failed")
         task_logger.success("OpenTofu initialization completed", category=LogCategory.STATUS)
 
+        # Instances that exist before the replace already reported ready on
+        # their own deploy; only the new one is waited for afterwards.
+        previous_instance_ids = {c.instance_id for c in parse_readiness_checks(collect_terraform_outputs())}
+
         phase_tracker.mark(
             PHASE_TERRAFORM_APPLY,
             f"Applying replace for {resource_address}",
@@ -1936,6 +1961,7 @@ def redeploy_resource(
         phase_tracker.mark(PHASE_CLEANUP, "Pulling final state")
         tf_state = collect_terraform_state()
         outputs = collect_terraform_outputs()
+        _run_readiness_checks(outputs, openstack_env, task_logger, skip_instance_ids=previous_instance_ids)
 
         task_logger.success(
             f"Deployment {deployment_id} redeploy of {resource_address} completed",

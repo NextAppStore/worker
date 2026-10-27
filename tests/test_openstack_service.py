@@ -277,6 +277,33 @@ class TestServerShow:
 
 
 # ---------------------------------------------------------------------------
+# console_log
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestConsoleLog:
+    """Tests for the console_log wrapper (readiness check)."""
+
+    def test_returns_stdout_on_success(self, service, mocker):
+        """Returns the raw console text and asks for the requested number of lines."""
+        mock_sp = mocker.patch(
+            "app.services.openstack_service.subprocess.run",
+            return_value=_CompletedStub(returncode=0, stdout="boot\nAPPSTORE-READY\n", stderr=""),
+        )
+        assert service.console_log("srv-1", lines=100) == "boot\nAPPSTORE-READY\n"
+        assert mock_sp.call_args.args[0] == ["openstack", "console", "log", "show", "--lines", "100", "srv-1"]
+
+    def test_returns_none_on_nonzero_rc(self, service, mocker):
+        """Returns None while the console is not available yet."""
+        mocker.patch(
+            "app.services.openstack_service.subprocess.run",
+            return_value=_CompletedStub(returncode=1, stdout="", stderr="Instance is building\n"),
+        )
+        assert service.console_log("srv-1") is None
+
+
+# ---------------------------------------------------------------------------
 # server_stop
 # ---------------------------------------------------------------------------
 

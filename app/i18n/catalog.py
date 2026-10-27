@@ -232,6 +232,26 @@ MESSAGES: dict[str, Message] = {
         "en": "Deployment {deployment_id} redeploy of {resource_address} completed",
         "de": "Deployment {deployment_id}: Neu-Deployment von {resource_address} abgeschlossen",
     },
+    "log.readiness_waiting": {
+        "en": "Waiting for {name} to report {marker} (up to {timeout}s)",
+        "de": "Warte auf {marker} von {name} (bis zu {timeout} s)",
+    },
+    "log.readiness_ready": {
+        "en": "{name}: ready after {elapsed}s",
+        "de": "{name}: bereit nach {elapsed} s",
+    },
+    "log.readiness_failed": {
+        "en": "{name} reported a failed start: {reason}",
+        "de": "{name} meldet einen fehlgeschlagenen Start: {reason}",
+    },
+    "log.readiness_timeout": {
+        "en": "{name}: readiness timed out",
+        "de": "{name}: Zeitüberschreitung beim Warten auf Bereitschaft",
+    },
+    "err.app_not_ready": {
+        "en": "App did not become ready: {errors}",
+        "de": "App wurde nicht bereit: {errors}",
+    },
     "log.resource_replaced": {
         "en": "Resource {resource_address} replaced",
         "de": "Ressource {resource_address} ersetzt",
