@@ -1,7 +1,16 @@
 FROM python:3.12-slim
 
-ENV POETRY_VIRTUALENVS_IN_PROJECT=true \
-    POETRY_VIRTUALENVS_CREATE=true
+# Set by buildx/buildah from the build platform; falls back to amd64 for
+# builders that don't populate it (e.g. plain `docker build`).
+ARG TARGETARCH=amd64
+
+# Venv outside /app — see backend/Dockerfile.dev for the rationale:
+# ../worker is bind-mounted onto /app for hot reload, and the anonymous
+# `- /app/.venv` volume that used to shield an in-project venv comes up
+# empty under podman-compose.
+ENV POETRY_VIRTUALENVS_IN_PROJECT=false \
+    POETRY_VIRTUALENVS_CREATE=true \
+    POETRY_VIRTUALENVS_PATH=/opt/venv
 
 WORKDIR /app
 
@@ -21,25 +30,29 @@ RUN pip install --no-cache-dir python-openstackclient
 
 # Install OpenTofu
 ARG OPENTOFU_VERSION=1.13.1
-RUN wget https://github.com/opentofu/opentofu/releases/download/v${OPENTOFU_VERSION}/tofu_${OPENTOFU_VERSION}_linux_amd64.zip \
-    && unzip tofu_${OPENTOFU_VERSION}_linux_amd64.zip \
+RUN wget https://github.com/opentofu/opentofu/releases/download/v${OPENTOFU_VERSION}/tofu_${OPENTOFU_VERSION}_linux_${TARGETARCH}.zip \
+    && unzip tofu_${OPENTOFU_VERSION}_linux_${TARGETARCH}.zip \
     && mv tofu /usr/local/bin/ \
-    && rm tofu_${OPENTOFU_VERSION}_linux_amd64.zip
+    && rm tofu_${OPENTOFU_VERSION}_linux_${TARGETARCH}.zip
 
 # Install Packer
 ARG PACKER_VERSION=1.10.0
-RUN wget https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_amd64.zip \
-    && unzip packer_${PACKER_VERSION}_linux_amd64.zip \
+RUN wget https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_${TARGETARCH}.zip \
+    && unzip packer_${PACKER_VERSION}_linux_${TARGETARCH}.zip \
     && mv packer /usr/local/bin/ \
-    && rm packer_${PACKER_VERSION}_linux_amd64.zip
+    && rm packer_${PACKER_VERSION}_linux_${TARGETARCH}.zip
 
 # Install Poetry
 RUN curl -sSL https://install.python-poetry.org | python3 - && \
     ln -s /root/.local/bin/poetry /usr/local/bin/poetry
 
-# Copy Poetry files and install dependencies
+# Copy Poetry files and install dependencies, then pin the venv to a
+# stable path (see backend/Dockerfile.dev for why we bypass `poetry run`).
 COPY pyproject.toml ./
-RUN poetry install --no-root --no-interaction --no-ansi
+RUN poetry install --no-root --no-interaction --no-ansi && \
+    ln -s "$(poetry env info --path)" /opt/appvenv
+
+ENV PATH="/opt/appvenv/bin:$PATH"
 
 # Copy application code
 COPY . .
@@ -56,5 +69,6 @@ ENV WORKER_JOB_UID_BASE=20000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["python3", "-c", "import os, sys, time; sys.exit(time.time() - os.path.getmtime(os.environ.get('WORKER_HEALTH_FILE', '/tmp/appstore-worker.healthy')) > 90)"]
 
-# Worker starten: LISTEN task_queued, Jobs aus der Postgres-Queue
-CMD ["poetry", "run", "python", "-m", "app"]
+# Worker starten: LISTEN task_queued, Jobs aus der Postgres-Queue.
+# Direkt der venv-Interpreter, siehe backend/Dockerfile.dev.
+CMD ["python", "-m", "app"]
