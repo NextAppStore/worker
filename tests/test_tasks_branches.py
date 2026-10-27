@@ -460,6 +460,7 @@ class TestDeployApplication:
             user_vars={"terraform": {}},
             teams=None,
             openstack_envelope={"project_id": "p1"},
+            locale="en",
         )
 
         assert result["status"] == "success"
@@ -527,6 +528,7 @@ class TestDeployApplication:
                 user_vars={"terraform": {}},
                 teams=None,
                 openstack_envelope={"project_id": "p1"},
+                locale="en",
             )
 
         assert "OpenTofu apply failed" in str(exc.value)
@@ -546,6 +548,7 @@ class TestDeployApplication:
                 user_vars={"terraform": {}},
                 teams=None,
                 openstack_envelope=None,
+                locale="en",
             )
         assert "envelope" in str(exc.value).lower()
 
@@ -666,6 +669,7 @@ class TestDestroyDeployment:
                 user_vars={"terraform": {}},
                 teams=None,
                 openstack_envelope={"project_id": "p1"},
+                locale="en",
             )
         assert "OpenTofu destroy failed" in str(exc.value)
 
@@ -743,6 +747,7 @@ class TestPauseResume:
                 user_vars={},
                 teams=None,
                 openstack_envelope={"project_id": "p1"},
+                locale="en",
             )
         assert "No compute instances" in str(exc.value)
         os_inst.server_stop.assert_not_called()
@@ -840,6 +845,7 @@ class TestRedeployResource:
                 teams=None,
                 openstack_envelope={"project_id": "p1"},
                 resource_address="; rm -rf /",
+                locale="en",
             )
         assert "invalid resource_address" in str(exc.value)
 

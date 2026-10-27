@@ -72,11 +72,8 @@ MESSAGES: dict[str, Message] = {
     },
     "phase.collect_outputs": {"en": "Collecting outputs", "de": "Ausgaben werden gesammelt"},
     "phase.destroy_resources": {"en": "Destroying resources", "de": "Ressourcen werden gelöscht"},
+    "phase.cleanup": {"en": "Cleaning up", "de": "Aufräumen"},
     "phase.final_state": {"en": "Pulling final state", "de": "Endgültiger State wird gelesen"},
-    "phase.final_state_snapshot": {
-        "en": "Pulling final state snapshot",
-        "de": "Snapshot des endgültigen States wird gelesen",
-    },
     "phase.server_stop": {"en": "Stopping {count} server(s)", "de": "{count} Server werden gestoppt"},
     "phase.server_start": {"en": "Starting {count} server(s)", "de": "{count} Server werden gestartet"},
     "phase.redeploy_apply": {
@@ -108,9 +105,9 @@ MESSAGES: dict[str, Message] = {
     "log.cloning": {"en": "Cloning repository: {app_git_link}", "de": "Repository wird geklont: {app_git_link}"},
     "log.cloning_same_ref": {
         "en": "Cloning {app_git_link} at {release} (same ref as the original deploy so OpenTofu code "
-        "matches the pg-backend state)",
+        "matches the stored state)",
         "de": "{app_git_link} wird bei {release} geklont (gleiche Referenz wie beim ursprünglichen "
-        "Deployment, damit der OpenTofu-Code zum State im pg-Backend passt)",
+        "Deployment, damit der OpenTofu-Code zum gespeicherten State passt)",
     },
     "log.repo_cloned": {"en": "Repository cloned", "de": "Repository geklont"},
     "log.repo_cloned_commit": {
@@ -134,21 +131,9 @@ MESSAGES: dict[str, Message] = {
         "en": "Could not extract commit info: {error}",
         "de": "Commit-Informationen konnten nicht gelesen werden: {error}",
     },
-    "log.state_pull_failed": {
-        "en": "Could not pull OpenTofu state: {error}",
-        "de": "OpenTofu-State konnte nicht abgerufen werden: {error}",
-    },
-    "log.state_read_failed": {
-        "en": "Could not read OpenTofu state: {error}",
-        "de": "OpenTofu-State konnte nicht gelesen werden: {error}",
-    },
     "log.outputs_read_failed": {
         "en": "Could not read OpenTofu outputs: {error}",
         "de": "OpenTofu-Ausgaben konnten nicht gelesen werden: {error}",
-    },
-    "log.state_pull_failed_after": {
-        "en": "Could not pull OpenTofu state post-{action}: {error}",
-        "de": "OpenTofu-State konnte nach {action} nicht abgerufen werden: {error}",
     },
     "log.image_exists": {
         "en": "{log_prefix}Image '{image_name}' already exists (ID: {image_id}). Skipping Packer build.",
