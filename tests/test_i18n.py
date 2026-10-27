@@ -83,8 +83,8 @@ def test_known_text_is_translated_and_english_is_untouched():
 
 
 def test_parameters_are_extracted():
-    assert localize_text("Could not pull OpenTofu state: connection refused", "de") == (
-        "OpenTofu-State konnte nicht abgerufen werden: connection refused"
+    assert localize_text("Could not read OpenTofu outputs: connection refused", "de") == (
+        "OpenTofu-Ausgaben konnten nicht gelesen werden: connection refused"
     )
 
 
@@ -242,11 +242,11 @@ def _messages(logger):
 def test_logger_translates_its_own_texts_in_german():
     logger = StructuredLogger("t", console=False, locale="de")
     logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
-    logger.warning("Could not read OpenTofu state: boom")
+    logger.warning("Could not read OpenTofu outputs: boom")
     logger.error("OpenTofu plan failed")
     assert _messages(logger) == [
         "Repository aufgeräumt",
-        "OpenTofu-State konnte nicht gelesen werden: boom",
+        "OpenTofu-Ausgaben konnten nicht gelesen werden: boom",
         "OpenTofu-Plan fehlgeschlagen",
     ]
 
