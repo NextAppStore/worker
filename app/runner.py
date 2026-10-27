@@ -79,6 +79,7 @@ def run_job(claimed: job_queue.ClaimedTask, events: job_queue.TaskEventSink) -> 
         "user_vars": payload.get("user_vars") or {},
         "teams": payload.get("teams") or {},
         "openstack_envelope": payload.get("openstack_envelope"),
+        "locale": payload.get("locale"),
     }
     if claimed.type == TaskType.REDEPLOY:
         kwargs["resource_address"] = payload.get("resource_address")

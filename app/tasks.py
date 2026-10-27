@@ -6,6 +6,7 @@ from typing import Any, Protocol
 import git
 
 from . import job_context
+from .i18n import DEFAULT_LOCALE, localize_text, normalize_locale
 from .services import (
     OpenStackService,
     OpenTofuExecutor,
@@ -597,6 +598,7 @@ def deploy_application(
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
     state_backend: StateBackend | None = None,
+    locale: str | None = None,
 ):
     """
     Deploy an application using OpenTofu and Packer
@@ -611,11 +613,15 @@ def deploy_application(
             shipped from the backend. Required for new deploys; the optional
             default exists only so older queued messages don't crash the
             worker on rollout (we raise immediately if it's missing).
+        locale: UI language of the requesting user ("de"/"en"), sent by the
+            backend in the task payload. Defaults to DEFAULT_LOCALE when
+            missing or unrecognised (older backends, direct calls in tests).
 
     Returns:
         dict: status, logs, commit_info, terraform_outputs
     """
-    task_logger = get_logger(f"deploy:{deployment_id}", correlation_id=deployment_id)
+    locale = normalize_locale(locale) if locale is not None else DEFAULT_LOCALE
+    task_logger = get_logger(f"deploy:{deployment_id}", correlation_id=deployment_id, locale=locale)
 
     # Wire the per-deployment logger to the task's event sink. Every buffered
     # log entry becomes a ``task-log`` event, and ``task_logger.progress``
@@ -931,7 +937,7 @@ def deploy_application(
 
         # Raise custom exception with all details
         raise Failure(
-            message=str(e),
+            message=localize_text(str(e), locale),
             deployment_id=deployment_id,
             logs_dict=task_logger.get_logs_dict(),
             commit_info=commit_info,
@@ -954,6 +960,7 @@ def destroy_deployment(
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
     state_backend: StateBackend | None = None,
+    locale: str | None = None,
 ):
     """Tear down a deployment via ``tofu destroy``.
 
@@ -971,7 +978,8 @@ def destroy_deployment(
     Args mirror ``deploy_application`` so the backend can re-dispatch
     the same persisted values without translation.
     """
-    task_logger = get_logger(f"destroy:{deployment_id}", correlation_id=deployment_id)
+    locale = normalize_locale(locale) if locale is not None else DEFAULT_LOCALE
+    task_logger = get_logger(f"destroy:{deployment_id}", correlation_id=deployment_id, locale=locale)
 
     bound_task = events
 
@@ -1140,7 +1148,7 @@ def destroy_deployment(
     except Exception as e:
         task_logger.exception(f"Destroy failed: {str(e)}", exception=e, deployment_id=deployment_id)
         raise Failure(
-            message=str(e),
+            message=localize_text(str(e), locale),
             deployment_id=deployment_id,
             logs_dict=task_logger.get_logs_dict(),
             commit_info=commit_info,
@@ -1210,6 +1218,7 @@ def _run_compute_lifecycle(
     phases: tuple[str, ...],
     server_phase: str,
     server_op: str,  # "stop" | "start"
+    locale: str | None,
 ):
     """Shared body for ``pause_deployment`` / ``resume_deployment``.
 
@@ -1225,7 +1234,8 @@ def _run_compute_lifecycle(
     failed" without any pointer to which instance is stuck.
     """
     label = f"{action}:{deployment_id}"
-    task_logger = get_logger(label, correlation_id=deployment_id)
+    locale = normalize_locale(locale) if locale is not None else DEFAULT_LOCALE
+    task_logger = get_logger(label, correlation_id=deployment_id, locale=locale)
 
     bound_task = events
 
@@ -1349,7 +1359,7 @@ def _run_compute_lifecycle(
                     category=LogCategory.ERROR,
                     server_id=sid,
                 )
-                failures.append((sid, err or "unknown error"))
+                failures.append((sid, localize_text(err or "unknown error", locale)))
 
         if failures:
             joined = "; ".join(f"{sid}: {err}" for sid, err in failures)
@@ -1377,7 +1387,7 @@ def _run_compute_lifecycle(
     except Exception as e:
         task_logger.exception(f"{action} failed: {str(e)}", exception=e, deployment_id=deployment_id)
         raise Failure(
-            message=str(e),
+            message=localize_text(str(e), locale),
             deployment_id=deployment_id,
             logs_dict=task_logger.get_logs_dict(),
             commit_info=None,
@@ -1398,6 +1408,7 @@ def pause_deployment(
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
     state_backend: StateBackend | None = None,
+    locale: str | None = None,
 ):
     """Halt a deployment by stopping all of its compute instances.
 
@@ -1420,6 +1431,7 @@ def pause_deployment(
         phases=_PHASES_PAUSE,
         server_phase=PHASE_SERVER_STOP,
         server_op="stop",
+        locale=locale,
     )
 
 
@@ -1433,6 +1445,7 @@ def resume_deployment(
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
     state_backend: StateBackend | None = None,
+    locale: str | None = None,
 ):
     """Resume a paused deployment by starting all of its compute instances.
 
@@ -1453,6 +1466,7 @@ def resume_deployment(
         phases=_PHASES_RESUME,
         server_phase=PHASE_SERVER_START,
         server_op="start",
+        locale=locale,
     )
 
 
@@ -1616,6 +1630,7 @@ def redeploy_resource(
     openstack_envelope: dict[str, Any] | None = None,
     resource_address: str | None = None,
     state_backend: StateBackend | None = None,
+    locale: str | None = None,
 ):
     """Replace ONE compute instance via ``-target`` + ``-replace``.
 
@@ -1628,7 +1643,8 @@ def redeploy_resource(
     Returns the same payload shape as deploy/destroy so recording the
     result stays generic.
     """
-    task_logger = get_logger(f"redeploy:{deployment_id}", correlation_id=deployment_id)
+    locale = normalize_locale(locale) if locale is not None else DEFAULT_LOCALE
+    task_logger = get_logger(f"redeploy:{deployment_id}", correlation_id=deployment_id, locale=locale)
 
     bound_task = events
 
@@ -1805,7 +1821,7 @@ def redeploy_resource(
     except Exception as e:
         task_logger.exception(f"Redeploy failed: {str(e)}", exception=e, deployment_id=deployment_id)
         raise Failure(
-            message=str(e),
+            message=localize_text(str(e), locale),
             deployment_id=deployment_id,
             logs_dict=task_logger.get_logs_dict(),
             commit_info=commit_info,
