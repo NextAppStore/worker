@@ -25,6 +25,10 @@ pydantic-settings = "^2.14.2"
 gitpython = "^3.1.62"
 pyyaml = "^6.0.1"
 cryptography = "^50.0"
+# Kubernetes-App student-pod management (backend#37). Client generation
+# tracks the K3s/K8s server minor; Kubernetes-App pins k3s to v1.31.x
+# (packer/variables.pkr.hcl), so 31.x is the matching client generation.
+kubernetes = "^31.0"
 
 [tool.poetry.group.dev.dependencies]
 # Linting & Formatting (ruff does both, like in the backend)

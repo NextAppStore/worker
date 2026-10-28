@@ -4,6 +4,7 @@ import re
 from typing import Any, Protocol
 
 import git
+from kubernetes import client as k8s
 
 from . import job_context
 from .i18n import DEFAULT_LOCALE, localize_text, normalize_locale
@@ -14,6 +15,7 @@ from .services import (
     PackerExecutor,
     PerTaskCloudsConfig,
     git_service,
+    k8s_lab,
 )
 from .services.opentofu_executor import StateBackend
 from .services.packer_discovery import PackerTemplateDiscoveryError, _discover_packer_templates, _PackerTemplate
@@ -1676,7 +1678,7 @@ def redeploy_resource(
         # we double-check the shape so an empty / malformed string from
         # a misconfigured caller doesn't reach the CLI.
         if not resource_address or not _REDEPLOY_ADDRESS_RE.match(resource_address):
-            raise Exception(f"redeploy_resource called with invalid resource_address: " f"{resource_address!r}")
+            raise Exception(f"redeploy_resource called with invalid resource_address: {resource_address!r}")
 
         phase_tracker.mark(PHASE_STARTING, f"Starting redeploy of {resource_address}")
         task_logger.resource_info(
@@ -1830,3 +1832,270 @@ def redeploy_resource(
 
     finally:
         _cleanup_task_resources(clouds_config, repo_path, task_logger)
+
+
+# ----------------------------------------------------------------
+# KUBERNETES-APP STUDENT-POD MANAGEMENT (labctl ported, backend#37)
+# ----------------------------------------------------------------
+#
+# No git clone, no Packer, no OpenTofu, no OpenStack credential — these
+# jobs only ever talk to one team's Kubernetes cluster via the kubeconfig
+# the backend already resolved and IPv4-patched (see ``runner.run_job``;
+# the worker's DB role cannot read another task's ``tasks.outputs`` to
+# derive it itself). Progress reporting reuses the same ``_PhaseTracker`` /
+# ``StructuredLogger`` plumbing every other job uses.
+
+_LAB_PHASE_VALIDATE = "LAB_VALIDATE"
+_LAB_PHASE_ROTATE_SECRET = "LAB_ROTATE_SECRET"
+_LAB_PHASE_ROLLOUT = "LAB_ROLLOUT"
+_LAB_PHASE_SCALE_DOWN = "LAB_SCALE_DOWN"
+_LAB_PHASE_RECREATE_PVC = "LAB_RECREATE_PVC"
+_LAB_PHASE_CREATE_OBJECTS = "LAB_CREATE_OBJECTS"
+_LAB_PHASE_DELETE_OBJECTS = "LAB_DELETE_OBJECTS"
+
+_PHASES_LAB_REASSIGN = (_LAB_PHASE_VALIDATE, _LAB_PHASE_ROTATE_SECRET, _LAB_PHASE_ROLLOUT)
+_PHASES_LAB_RESET = (_LAB_PHASE_VALIDATE, _LAB_PHASE_SCALE_DOWN, _LAB_PHASE_RECREATE_PVC, _LAB_PHASE_ROLLOUT)
+_PHASES_LAB_ADD_STUDENT = (_LAB_PHASE_VALIDATE, _LAB_PHASE_CREATE_OBJECTS, _LAB_PHASE_ROLLOUT)
+_PHASES_LAB_REMOVE_STUDENT = (_LAB_PHASE_VALIDATE, _LAB_PHASE_DELETE_OBJECTS)
+
+
+def _lab_logger(action: str, deployment_id: str, team: str, username: str, locale: str | None):
+    locale = normalize_locale(locale) if locale is not None else DEFAULT_LOCALE
+    task_logger = get_logger(f"lab:{action}:{deployment_id}:{username}", correlation_id=deployment_id, locale=locale)
+    return task_logger, locale
+
+
+def _lab_failure(task_logger, message: str, deployment_id: str, locale: str) -> "Failure":
+    return Failure(
+        message=localize_text(message, locale),
+        deployment_id=deployment_id,
+        logs_dict=task_logger.get_logs_dict(),
+        commit_info=None,
+        terraform_outputs={},
+    )
+
+
+def lab_reassign_student(
+    events: JobEvents,
+    deployment_id: str,
+    team: str,
+    student_username: str,
+    kubeconfig: str,
+    new_password: str | None = None,
+    locale: str | None = None,
+):
+    """New pod for a student, home directory kept (``labctl reassign``).
+
+    When ``new_password`` is not ``None`` (``labctl passwd``'s call chain:
+    rotate the secret, then reassign), the student's Secret is rotated
+    first — a random password if the caller passed an empty/placeholder
+    value is NOT generated here; the backend already resolved it or left
+    it ``None`` for "keep current password, just reassign".
+    """
+    task_logger, locale = _lab_logger("reassign", deployment_id, team, student_username, locale)
+    bound_task = events
+    task_logger.set_event_emitter(
+        lambda name, payload: bound_task.send_event(name, deployment_id=deployment_id, **payload)
+    )
+    phase_tracker = _PhaseTracker(task_logger, _PHASES_LAB_REASSIGN)
+    generated_password: str | None = None
+
+    try:
+        phase_tracker.mark(_LAB_PHASE_VALIDATE, f"Validating '{student_username}'")
+        k8s_lab.validate_username(student_username)
+
+        with k8s_lab.api_client_from_kubeconfig(kubeconfig) as api:
+            apps_api = k8s.AppsV1Api(api)
+            core_api = k8s.CoreV1Api(api)
+            if not k8s_lab.student_exists(apps_api, student_username):
+                raise Exception(f"Student '{student_username}' does not exist")
+
+            if new_password is not None:
+                phase_tracker.mark(_LAB_PHASE_ROTATE_SECRET, "Rotating password")
+                generated_password = new_password or k8s_lab.random_password()
+                k8s_lab.apply_secret(core_api, student_username, generated_password)
+
+            generation = k8s_lab.generation_of(apps_api, student_username) + 1
+            phase_tracker.mark(_LAB_PHASE_ROLLOUT, f"Rolling out generation {generation}")
+            k8s_lab.patch_generation(apps_api, student_username, generation)
+            k8s_lab.wait_for_rollout(apps_api, student_username)
+
+        task_logger.success(f"'{student_username}' reassigned, home directory unchanged", category=LogCategory.STATUS)
+        result: dict[str, Any] = {
+            "status": "success",
+            "deployment_id": deployment_id,
+            "logs": task_logger.get_logs_dict(),
+            "commit_info": None,
+            "terraform_outputs": {},
+        }
+        if generated_password is not None:
+            result["lab_result"] = {"username": student_username, "generated_password": generated_password}
+        return result
+
+    except Exception as e:
+        task_logger.exception(f"Reassign failed: {str(e)}", exception=e, deployment_id=deployment_id)
+        raise _lab_failure(task_logger, str(e), deployment_id, locale)
+
+
+def lab_reset_student(
+    events: JobEvents,
+    deployment_id: str,
+    team: str,
+    student_username: str,
+    kubeconfig: str,
+    new_password_requested: bool = False,
+    locale: str | None = None,
+):
+    """New pod and empty home directory for a student (``labctl reset``)."""
+    task_logger, locale = _lab_logger("reset", deployment_id, team, student_username, locale)
+    bound_task = events
+    task_logger.set_event_emitter(
+        lambda name, payload: bound_task.send_event(name, deployment_id=deployment_id, **payload)
+    )
+    phase_tracker = _PhaseTracker(task_logger, _PHASES_LAB_RESET)
+    generated_password: str | None = None
+
+    try:
+        phase_tracker.mark(_LAB_PHASE_VALIDATE, f"Validating '{student_username}'")
+        k8s_lab.validate_username(student_username)
+
+        with k8s_lab.api_client_from_kubeconfig(kubeconfig) as api:
+            apps_api = k8s.AppsV1Api(api)
+            core_api = k8s.CoreV1Api(api)
+            if not k8s_lab.student_exists(apps_api, student_username):
+                raise Exception(f"Student '{student_username}' does not exist")
+            generation = k8s_lab.generation_of(apps_api, student_username) + 1
+
+            phase_tracker.mark(_LAB_PHASE_SCALE_DOWN, "Scaling down")
+            k8s_lab.scale(apps_api, student_username, 0)
+            k8s_lab.wait_for_pod_deleted(core_api, student_username)
+
+            phase_tracker.mark(_LAB_PHASE_RECREATE_PVC, "Recreating home directory")
+            k8s_lab.delete_pvc(core_api, student_username, wait=True)
+            k8s_lab.apply_pvc(core_api, student_username)
+            if new_password_requested:
+                generated_password = k8s_lab.random_password()
+                k8s_lab.apply_secret(core_api, student_username, generated_password)
+
+            phase_tracker.mark(_LAB_PHASE_ROLLOUT, f"Rolling out generation {generation}")
+            k8s_lab.scale_and_bump_generation(apps_api, student_username, 1, generation)
+            k8s_lab.wait_for_rollout(apps_api, student_username)
+
+        task_logger.success(f"'{student_username}' reset, home directory is empty", category=LogCategory.STATUS)
+        result: dict[str, Any] = {
+            "status": "success",
+            "deployment_id": deployment_id,
+            "logs": task_logger.get_logs_dict(),
+            "commit_info": None,
+            "terraform_outputs": {},
+        }
+        if generated_password is not None:
+            result["lab_result"] = {"username": student_username, "generated_password": generated_password}
+        return result
+
+    except Exception as e:
+        task_logger.exception(f"Reset failed: {str(e)}", exception=e, deployment_id=deployment_id)
+        raise _lab_failure(task_logger, str(e), deployment_id, locale)
+
+
+def lab_add_student(
+    events: JobEvents,
+    deployment_id: str,
+    team: str,
+    student_username: str,
+    kubeconfig: str,
+    student_password: str | None = None,
+    node_port: int | None = None,
+    locale: str | None = None,
+):
+    """Create a new student pod (``labctl add-student``)."""
+    task_logger, locale = _lab_logger("add-student", deployment_id, team, student_username, locale)
+    bound_task = events
+    task_logger.set_event_emitter(
+        lambda name, payload: bound_task.send_event(name, deployment_id=deployment_id, **payload)
+    )
+    phase_tracker = _PhaseTracker(task_logger, _PHASES_LAB_ADD_STUDENT)
+
+    try:
+        phase_tracker.mark(_LAB_PHASE_VALIDATE, f"Validating '{student_username}'")
+        k8s_lab.validate_username(student_username)
+
+        with k8s_lab.api_client_from_kubeconfig(kubeconfig) as api:
+            apps_api = k8s.AppsV1Api(api)
+            core_api = k8s.CoreV1Api(api)
+            if k8s_lab.student_exists(apps_api, student_username):
+                raise Exception(f"Student '{student_username}' already exists")
+
+            password = student_password or k8s_lab.random_password()
+            port = node_port
+            if port is None:
+                port = k8s_lab.next_free_port(core_api)
+            elif port in k8s_lab.used_ports(core_api):
+                raise Exception(f"Port {port} is already in use")
+
+            phase_tracker.mark(_LAB_PHASE_CREATE_OBJECTS, f"Creating pod on port {port}")
+            k8s_lab.apply_pvc(core_api, student_username)
+            k8s_lab.apply_secret(core_api, student_username, password)
+            k8s_lab.apply_workload(apps_api, core_api, student_username, port, 1)
+
+            phase_tracker.mark(_LAB_PHASE_ROLLOUT, "Waiting for the pod to become ready")
+            k8s_lab.wait_for_rollout(apps_api, student_username, timeout_s=60)
+
+        task_logger.success(f"Student '{student_username}' created: port {port}", category=LogCategory.STATUS)
+        return {
+            "status": "success",
+            "deployment_id": deployment_id,
+            "logs": task_logger.get_logs_dict(),
+            "commit_info": None,
+            "terraform_outputs": {},
+            "lab_result": {"username": student_username, "generated_password": password, "port": port},
+        }
+
+    except Exception as e:
+        task_logger.exception(f"Add student failed: {str(e)}", exception=e, deployment_id=deployment_id)
+        raise _lab_failure(task_logger, str(e), deployment_id, locale)
+
+
+def lab_remove_student(
+    events: JobEvents,
+    deployment_id: str,
+    team: str,
+    student_username: str,
+    kubeconfig: str,
+    locale: str | None = None,
+):
+    """Delete a student's pod, service, secret and home directory (``labctl remove-student``)."""
+    task_logger, locale = _lab_logger("remove-student", deployment_id, team, student_username, locale)
+    bound_task = events
+    task_logger.set_event_emitter(
+        lambda name, payload: bound_task.send_event(name, deployment_id=deployment_id, **payload)
+    )
+    phase_tracker = _PhaseTracker(task_logger, _PHASES_LAB_REMOVE_STUDENT)
+
+    try:
+        phase_tracker.mark(_LAB_PHASE_VALIDATE, f"Validating '{student_username}'")
+        k8s_lab.validate_username(student_username)
+
+        with k8s_lab.api_client_from_kubeconfig(kubeconfig) as api:
+            apps_api = k8s.AppsV1Api(api)
+            core_api = k8s.CoreV1Api(api)
+            if not k8s_lab.student_exists(apps_api, student_username):
+                raise Exception(f"Student '{student_username}' does not exist")
+
+            phase_tracker.mark(_LAB_PHASE_DELETE_OBJECTS, f"Removing '{student_username}'")
+            k8s_lab.delete_student_objects(apps_api, core_api, student_username)
+            k8s_lab.wait_for_pod_deleted(core_api, student_username)
+            k8s_lab.delete_pvc(core_api, student_username, wait=False)
+
+        task_logger.success(f"Student '{student_username}' removed", category=LogCategory.STATUS)
+        return {
+            "status": "success",
+            "deployment_id": deployment_id,
+            "logs": task_logger.get_logs_dict(),
+            "commit_info": None,
+            "terraform_outputs": {},
+        }
+
+    except Exception as e:
+        task_logger.exception(f"Remove student failed: {str(e)}", exception=e, deployment_id=deployment_id)
+        raise _lab_failure(task_logger, str(e), deployment_id, locale)

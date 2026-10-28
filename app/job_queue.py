@@ -289,6 +289,22 @@ def success_columns(result: Any) -> dict[str, Any]:
     }
 
 
+def success_event_extra(result: Any) -> dict[str, Any]:
+    """Extra fields for the terminal ``task-succeeded`` *event only*.
+
+    Lab jobs (``lab_add_student``/``lab_reset_student`` with a new
+    password/``lab_reassign_student`` as ``passwd``) return a one-time
+    generated/rotated password under ``result["lab_result"]``. It must
+    reach the triggering instructor exactly once and never be persisted:
+    not in ``tasks.outputs`` (read repeatedly by ``get_deployment_outputs``
+    for unrelated purposes — see ``success_columns``, which deliberately
+    does not look at this key), only in this one ``task_events`` row.
+    """
+    result = result if isinstance(result, dict) else {}
+    lab_result = result.get("lab_result")
+    return {"lab_result": lab_result} if isinstance(lab_result, dict) else {}
+
+
 def failure_columns(error: BaseException) -> dict[str, Any]:
     """Task columns for a job that raised.
 
@@ -317,9 +333,18 @@ def failure_columns(error: BaseException) -> dict[str, Any]:
 
 
 def _terminal_event(
-    task_id: uuid.UUID, deployment_id: uuid.UUID, task_type: TaskType, status: TaskStatus, failure_kind: str | None
+    task_id: uuid.UUID,
+    deployment_id: uuid.UUID,
+    task_type: TaskType,
+    status: TaskStatus,
+    failure_kind: str | None,
+    event_extra: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """The last event of a task's stream (same shape the backend's reaper writes)."""
+    """The last event of a task's stream (same shape the backend's reaper writes).
+
+    ``event_extra`` (see ``success_event_extra``) rides in this event only —
+    it is never written to any ``tasks`` column.
+    """
     event_type = EVENT_SUCCEEDED if status == TaskStatus.SUCCESS else EVENT_FAILED
     payload: dict[str, Any] = {
         "type": event_type,
@@ -330,6 +355,8 @@ def _terminal_event(
     }
     if status == TaskStatus.FAILED and failure_kind:
         payload["failure_kind"] = failure_kind
+    if event_extra:
+        payload.update(event_extra)
     return event_type, payload
 
 
@@ -341,6 +368,7 @@ def _finish(
     status: TaskStatus,
     columns: dict[str, Any],
     failure_kind: str | None = None,
+    event_extra: dict[str, Any] | None = None,
 ) -> None:
     """Set the terminal status and result columns and append the terminal event. Does not commit."""
     session.execute(
@@ -348,7 +376,7 @@ def _finish(
         .where(tasks.c.taskId == task_id)
         .values(**columns, status=status, finished_at=utcnow(), lease_until=None)
     )
-    event_type, payload = _terminal_event(task_id, deployment_id, task_type, status, failure_kind)
+    event_type, payload = _terminal_event(task_id, deployment_id, task_type, status, failure_kind, event_extra)
     session.execute(
         insert(task_events).values(taskId=task_id, type=event_type, payload=json.dumps(payload), created_at=utcnow())
     )
@@ -361,6 +389,7 @@ def record_result(
     status: TaskStatus,
     columns: dict[str, Any],
     failure_kind: str | None = None,
+    event_extra: dict[str, Any] | None = None,
 ) -> None:
     """Store a finished job's result and end the task's event stream.
 
@@ -375,7 +404,16 @@ def record_result(
             select(tasks.c.status, tasks.c.claimed_by).where(tasks.c.taskId == claimed.task_id).with_for_update()
         ).one()
         if row.status == TaskStatus.RUNNING and row.claimed_by == worker_id:
-            _finish(session, claimed.task_id, claimed.deployment_id, claimed.type, status, columns, failure_kind)
+            _finish(
+                session,
+                claimed.task_id,
+                claimed.deployment_id,
+                claimed.type,
+                status,
+                columns,
+                failure_kind,
+                event_extra,
+            )
         else:
             logger.warning(
                 "task %s finished after its lease was taken over; keeping its status %s",

@@ -50,7 +50,18 @@ JOBS: dict[TaskType, Callable[..., Any]] = {
     TaskType.PAUSE: tasks.pause_deployment,
     TaskType.RESUME: tasks.resume_deployment,
     TaskType.REDEPLOY: tasks.redeploy_resource,
+    TaskType.LAB_REASSIGN: tasks.lab_reassign_student,
+    TaskType.LAB_RESET: tasks.lab_reset_student,
+    TaskType.LAB_ADD_STUDENT: tasks.lab_add_student,
+    TaskType.LAB_REMOVE_STUDENT: tasks.lab_remove_student,
 }
+
+# Lab jobs (Kubernetes-App student-pod management) take a payload shaped
+# nothing like deploy/pause/resume/redeploy's — no app/OpenStack/Terraform
+# fields at all, just which team's cluster and which student.
+_LAB_TASK_TYPES = frozenset(
+    {TaskType.LAB_REASSIGN, TaskType.LAB_RESET, TaskType.LAB_ADD_STUDENT, TaskType.LAB_REMOVE_STUDENT}
+)
 
 _RECONNECT_MIN_S = 1.0
 _RECONNECT_MAX_S = 30.0
@@ -67,11 +78,34 @@ def run_job(claimed: job_queue.ClaimedTask, events: job_queue.TaskEventSink) -> 
     ValueError for a task type without a job; whatever the job raises
     (usually ``tasks.Failure``) propagates.
     """
-    job = JOBS.get(TaskType(claimed.type))
+    task_type = TaskType(claimed.type)
+    job = JOBS.get(task_type)
     if job is None:
-        raise ValueError(f"no job for task type {TaskType(claimed.type).value}")
+        raise ValueError(f"no job for task type {task_type.value}")
     payload = claimed.payload
-    kwargs: dict[str, Any] = {
+
+    if task_type in _LAB_TASK_TYPES:
+        # No app/OpenStack/Terraform fields, no OpenTofu state backend —
+        # lab jobs only ever talk to the team's Kubernetes cluster, via
+        # the already-IPv4-patched kubeconfig the backend put in the payload
+        # (the worker's DB role cannot SELECT another task's ``outputs``).
+        kwargs = {
+            "deployment_id": str(claimed.deployment_id),
+            "team": payload["team"],
+            "student_username": payload["student_username"],
+            "kubeconfig": payload["kubeconfig"],
+            "locale": payload.get("locale"),
+        }
+        if task_type == TaskType.LAB_REASSIGN:
+            kwargs["new_password"] = payload.get("student_password") if payload.get("new_password_requested") else None
+        elif task_type == TaskType.LAB_RESET:
+            kwargs["new_password_requested"] = payload.get("new_password_requested", False)
+        elif task_type == TaskType.LAB_ADD_STUDENT:
+            kwargs["student_password"] = payload.get("student_password")
+            kwargs["node_port"] = payload.get("node_port")
+        return job(events, **kwargs)
+
+    kwargs = {
         "deployment_id": str(claimed.deployment_id),
         "app_id": payload["app_id"],
         "app_git_link": payload["app_git_link"],
@@ -81,7 +115,7 @@ def run_job(claimed: job_queue.ClaimedTask, events: job_queue.TaskEventSink) -> 
         "openstack_envelope": payload.get("openstack_envelope"),
         "locale": payload.get("locale"),
     }
-    if claimed.type == TaskType.REDEPLOY:
+    if task_type == TaskType.REDEPLOY:
         kwargs["resource_address"] = payload.get("resource_address")
     token = payload.get("state_token")
     if token:
@@ -108,6 +142,7 @@ def process_next(worker_id: str, slot: int = 0, session_factory=SessionLocal) ->
 
     events = job_queue.TaskEventSink(session_factory, claimed.task_id)
     kind: str | None = None
+    event_extra: dict[str, Any] = {}
     with job_queue.Lease(session_factory, claimed.task_id, worker_id, settings.WORKER_LEASE_SECONDS):
         try:
             with job_context.bind(job_context.for_slot(slot)):
@@ -117,10 +152,11 @@ def process_next(worker_id: str, slot: int = 0, session_factory=SessionLocal) ->
             status, columns, kind = TaskStatus.FAILED, job_queue.failure_columns(e), FAILURE_KIND_JOB
         else:
             status, columns = TaskStatus.SUCCESS, job_queue.success_columns(result)
+            event_extra = job_queue.success_event_extra(result)
         finally:
             # All progress/log events are in the table before the terminal one.
             events.close()
-    job_queue.record_result(session_factory, claimed, worker_id, status, columns, kind)
+    job_queue.record_result(session_factory, claimed, worker_id, status, columns, kind, event_extra)
     logger.info("task %s finished: %s", claimed.task_id, status.value)
     return True
 

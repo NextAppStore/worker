@@ -37,6 +37,13 @@ class TaskType(enum.StrEnum):
     PAUSE = "pause"
     RESUME = "resume"
     REDEPLOY = "redeploy"
+    # Kubernetes-App student-pod management (labctl ported, backend#37).
+    # ``passwd`` is not its own type — it rotates the secret then reassigns,
+    # carried by LAB_REASSIGN with an extra payload flag.
+    LAB_REASSIGN = "lab_reassign"
+    LAB_RESET = "lab_reset"
+    LAB_ADD_STUDENT = "lab_add_student"
+    LAB_REMOVE_STUDENT = "lab_remove_student"
 
 
 metadata = MetaData()
