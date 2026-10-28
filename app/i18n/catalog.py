@@ -387,4 +387,65 @@ MESSAGES: dict[str, Message] = {
         "Unterverzeichnisse packer/<key>/template.pkr.hcl ({keys}). Bitte ein Layout wählen — entweder die "
         "alte Datei oder die Unterverzeichnisse entfernen.",
     },
+    # ------------------------------------------------------------------
+    # Kubernetes-App Studenten-Pod-Verwaltung (labctl, backend#37)
+    # ------------------------------------------------------------------
+    "phase.lab_validate": {"en": "Validating '{username}'", "de": "'{username}' wird geprüft"},
+    "phase.lab_rotate_secret": {"en": "Rotating password", "de": "Passwort wird erneuert"},
+    "phase.lab_rollout": {
+        "en": "Rolling out generation {generation}",
+        "de": "Generation {generation} wird ausgerollt",
+    },
+    "phase.lab_scale_down": {"en": "Scaling down", "de": "Pod wird herunterskaliert"},
+    "phase.lab_recreate_pvc": {
+        "en": "Recreating home directory",
+        "de": "Home-Verzeichnis wird neu angelegt",
+    },
+    "phase.lab_create_objects": {
+        "en": "Creating pod on port {port}",
+        "de": "Pod wird auf Port {port} angelegt",
+    },
+    "phase.lab_wait_ready": {
+        "en": "Waiting for the pod to become ready",
+        "de": "Warten, bis der Pod bereit ist",
+    },
+    "phase.lab_delete_objects": {"en": "Removing '{username}'", "de": "'{username}' wird entfernt"},
+    "log.lab_reassigned": {
+        "en": "'{username}' reassigned, home directory unchanged",
+        "de": "'{username}' neu zugewiesen, Home-Verzeichnis unverändert",
+    },
+    "log.lab_reset": {
+        "en": "'{username}' reset, home directory is empty",
+        "de": "'{username}' zurückgesetzt, Home-Verzeichnis ist leer",
+    },
+    "log.lab_student_created": {
+        "en": "Student '{username}' created: port {port}",
+        "de": "Student*in '{username}' angelegt: Port {port}",
+    },
+    "log.lab_student_removed": {
+        "en": "Student '{username}' removed",
+        "de": "Student*in '{username}' entfernt",
+    },
+    "error.lab_student_not_found": {
+        "en": "Student '{username}' does not exist",
+        "de": "Student*in '{username}' existiert nicht",
+    },
+    "error.lab_student_exists": {
+        "en": "Student '{username}' already exists",
+        "de": "Student*in '{username}' existiert bereits",
+    },
+    "error.lab_port_in_use": {
+        "en": "Port {port} is already in use",
+        "de": "Port {port} wird bereits verwendet",
+    },
+    "error.lab_reassign_failed": {"en": "Reassign failed: {error}", "de": "Neuzuweisung fehlgeschlagen: {error}"},
+    "error.lab_reset_failed": {"en": "Reset failed: {error}", "de": "Zurücksetzen fehlgeschlagen: {error}"},
+    "error.lab_add_student_failed": {
+        "en": "Add student failed: {error}",
+        "de": "Anlegen des Studenten fehlgeschlagen: {error}",
+    },
+    "error.lab_remove_student_failed": {
+        "en": "Remove student failed: {error}",
+        "de": "Entfernen des Studenten fehlgeschlagen: {error}",
+    },
 }

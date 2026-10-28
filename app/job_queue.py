@@ -405,7 +405,14 @@ def record_result(
         ).one()
         if row.status == TaskStatus.RUNNING and row.claimed_by == worker_id:
             _finish(
-                session, claimed.task_id, claimed.deployment_id, claimed.type, status, columns, failure_kind, event_extra
+                session,
+                claimed.task_id,
+                claimed.deployment_id,
+                claimed.type,
+                status,
+                columns,
+                failure_kind,
+                event_extra,
             )
         else:
             logger.warning(

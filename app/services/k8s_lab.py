@@ -15,17 +15,21 @@ the ``server`` field.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import secrets
 import tempfile
 import time
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import TYPE_CHECKING
 
 from kubernetes import client as k8s
 from kubernetes import config as k8s_config
 from kubernetes.client.exceptions import ApiException
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 LAB_NAMESPACE = "lab"
 _FIRST_PORT = 30001
@@ -78,14 +82,10 @@ def api_client_from_kubeconfig(kubeconfig_yaml: str) -> Iterator[k8s.ApiClient]:
         yield api_client
     finally:
         if api_client is not None:
-            try:
+            with contextlib.suppress(Exception):
                 api_client.close()
-            except Exception:
-                pass
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(kubeconfig_path)
-        except OSError:
-            pass
 
 
 def student_exists(apps_api: k8s.AppsV1Api, username: str) -> bool:
@@ -191,7 +191,10 @@ def _workload_manifests(username: str, port: int, generation: int) -> tuple[k8s.
             )
         ],
         volumes=[
-            k8s.V1Volume(name="home", persistent_volume_claim=k8s.V1PersistentVolumeClaimVolumeSource(claim_name=f"home-{username}")),
+            k8s.V1Volume(
+                name="home",
+                persistent_volume_claim=k8s.V1PersistentVolumeClaimVolumeSource(claim_name=f"home-{username}"),
+            ),
             k8s.V1Volume(
                 name="password",
                 secret=k8s.V1SecretVolumeSource(
@@ -266,7 +269,12 @@ def scale_and_bump_generation(apps_api: k8s.AppsV1Api, username: str, replicas: 
     apps_api.patch_namespaced_deployment(
         f"student-{username}",
         LAB_NAMESPACE,
-        {"spec": {"replicas": replicas, "template": {"metadata": {"annotations": {"lab-generation": str(generation)}}}}},
+        {
+            "spec": {
+                "replicas": replicas,
+                "template": {"metadata": {"annotations": {"lab-generation": str(generation)}}},
+            }
+        },
     )
 
 
@@ -295,11 +303,12 @@ def _wait_for_pvc_deleted(core_api: k8s.CoreV1Api, username: str, timeout_s: int
 
 def delete_student_objects(apps_api: k8s.AppsV1Api, core_api: k8s.CoreV1Api, username: str) -> None:
     """Delete Deployment, Service and Secret (``labctl remove-student``'s first step)."""
-    for api, kind, delete in (
-        (apps_api, "deployment", lambda: apps_api.delete_namespaced_deployment(f"student-{username}", LAB_NAMESPACE)),
-        (core_api, "service", lambda: core_api.delete_namespaced_service(f"student-{username}", LAB_NAMESPACE)),
-        (core_api, "secret", lambda: core_api.delete_namespaced_secret(f"student-{username}", LAB_NAMESPACE)),
-    ):
+    deletes = (
+        lambda: apps_api.delete_namespaced_deployment(f"student-{username}", LAB_NAMESPACE),
+        lambda: core_api.delete_namespaced_service(f"student-{username}", LAB_NAMESPACE),
+        lambda: core_api.delete_namespaced_secret(f"student-{username}", LAB_NAMESPACE),
+    )
+    for delete in deletes:
         try:
             delete()
         except ApiException as e:

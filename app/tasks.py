@@ -15,8 +15,8 @@ from .services import (
     PackerExecutor,
     PerTaskCloudsConfig,
     git_service,
+    k8s_lab,
 )
-from .services import k8s_lab
 from .services.opentofu_executor import StateBackend
 from .services.packer_discovery import PackerTemplateDiscoveryError, _discover_packer_templates, _PackerTemplate
 from .utils.logger import LogCategory, get_logger
@@ -1678,7 +1678,7 @@ def redeploy_resource(
         # we double-check the shape so an empty / malformed string from
         # a misconfigured caller doesn't reach the CLI.
         if not resource_address or not _REDEPLOY_ADDRESS_RE.match(resource_address):
-            raise Exception(f"redeploy_resource called with invalid resource_address: " f"{resource_address!r}")
+            raise Exception(f"redeploy_resource called with invalid resource_address: {resource_address!r}")
 
         phase_tracker.mark(PHASE_STARTING, f"Starting redeploy of {resource_address}")
         task_logger.resource_info(
@@ -1894,7 +1894,9 @@ def lab_reassign_student(
     """
     task_logger, locale = _lab_logger("reassign", deployment_id, team, student_username, locale)
     bound_task = events
-    task_logger.set_event_emitter(lambda name, payload: bound_task.send_event(name, deployment_id=deployment_id, **payload))
+    task_logger.set_event_emitter(
+        lambda name, payload: bound_task.send_event(name, deployment_id=deployment_id, **payload)
+    )
     phase_tracker = _PhaseTracker(task_logger, _PHASES_LAB_REASSIGN)
     generated_password: str | None = None
 
@@ -1947,7 +1949,9 @@ def lab_reset_student(
     """New pod and empty home directory for a student (``labctl reset``)."""
     task_logger, locale = _lab_logger("reset", deployment_id, team, student_username, locale)
     bound_task = events
-    task_logger.set_event_emitter(lambda name, payload: bound_task.send_event(name, deployment_id=deployment_id, **payload))
+    task_logger.set_event_emitter(
+        lambda name, payload: bound_task.send_event(name, deployment_id=deployment_id, **payload)
+    )
     phase_tracker = _PhaseTracker(task_logger, _PHASES_LAB_RESET)
     generated_password: str | None = None
 
@@ -2007,7 +2011,9 @@ def lab_add_student(
     """Create a new student pod (``labctl add-student``)."""
     task_logger, locale = _lab_logger("add-student", deployment_id, team, student_username, locale)
     bound_task = events
-    task_logger.set_event_emitter(lambda name, payload: bound_task.send_event(name, deployment_id=deployment_id, **payload))
+    task_logger.set_event_emitter(
+        lambda name, payload: bound_task.send_event(name, deployment_id=deployment_id, **payload)
+    )
     phase_tracker = _PhaseTracker(task_logger, _PHASES_LAB_ADD_STUDENT)
 
     try:
@@ -2061,7 +2067,9 @@ def lab_remove_student(
     """Delete a student's pod, service, secret and home directory (``labctl remove-student``)."""
     task_logger, locale = _lab_logger("remove-student", deployment_id, team, student_username, locale)
     bound_task = events
-    task_logger.set_event_emitter(lambda name, payload: bound_task.send_event(name, deployment_id=deployment_id, **payload))
+    task_logger.set_event_emitter(
+        lambda name, payload: bound_task.send_event(name, deployment_id=deployment_id, **payload)
+    )
     phase_tracker = _PhaseTracker(task_logger, _PHASES_LAB_REMOVE_STUDENT)
 
     try:
