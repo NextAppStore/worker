@@ -6,11 +6,12 @@ rollout/port logic are ported 1:1 from the bash script
 this worker creates are indistinguishable from the ones the script would
 have created on the VM.
 
-The kubeconfig arrives from the backend already IPv4-patched (the worker's
-DB role cannot read another task's ``tasks.outputs`` to re-derive the
-IPv4/CA itself — see ``app.job_tables``/``f8a9b0c1d2e3_worker_role``), so
-this module only builds an ``ApiClient`` from the string, it never touches
-the ``server`` field.
+The kubeconfig arrives from the backend as provisioned, unpatched — its
+``server`` is the cluster's IPv6 address (the worker's DB role cannot read
+another task's ``tasks.outputs`` to re-derive it itself — see
+``app.job_tables``/``f8a9b0c1d2e3_worker_role``), so this module only
+builds an ``ApiClient`` from the string, it never touches the ``server``
+field.
 """
 
 from __future__ import annotations
